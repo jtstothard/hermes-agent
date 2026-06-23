@@ -1007,8 +1007,6 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
             "Unknown reasoning_effort '%s', using default (medium)", effort
         )
     return result
-
-
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

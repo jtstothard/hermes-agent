@@ -2072,7 +2072,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
-    # ── Re-resolve reasoning_config from per-model override ──
+    # Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
     # config so the override takes effect immediately on /model switch —
     # resolved through the shared chokepoint (per-model > global; YAML
