@@ -6508,8 +6508,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             service_arg = shlex.quote(service_name)
+            # Bounded-wait: give the gateway up to 60s to exit voluntarily
+            # (drain_timeout + teardown buffer). If it hasn't gone by then,
+            # the helper proceeds anyway so the restart isn't stuck forever.
+            # See GitHub issue: planned-restart helper hangs indefinitely when
+            # post-_stop_impl() cleanup blocks (cron/housekeeping thread joins,
+            # MCP shutdown). SIGKILL is intentionally NOT sent — we prefer a
+            # potentially-wedged process over data loss. The thread-shutdown
+            # watchdog (#66892) will os._exit() the process independently if
+            # the loop truly freezes.
             shell_cmd = (
-                f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
+                f"deadline=$(( $(date +%s) + 60 )); "
+                f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
                 f"{systemctl_scope} reset-failed {service_arg}; "
                 f"{systemctl_scope} restart {service_arg}"
             )
