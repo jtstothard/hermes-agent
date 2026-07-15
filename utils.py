@@ -35,6 +35,19 @@ def env_var_enabled(name: str, default: str = "") -> bool:
     return is_truthy_value(os.getenv(name, default), default=False)
 
 
+def fibonacci(n: int) -> int:
+    """Return the nth Fibonacci number."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise TypeError("n must be an integer")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+
+    previous, current = 0, 1
+    for _ in range(n):
+        previous, current = current, previous + current
+    return previous
+
+
 def _preserve_file_mode(path: Path) -> "int | None":
     """Capture the permission bits of *path* if it exists, else ``None``."""
     try:
