@@ -1077,10 +1077,10 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _boards_with_spawnable() -> set[str]:
+            """Cheap probe: return set of board slugs that have at least one
+            ready+assigned+unclaimed task whose assignee maps to a real
+            Hermes profile (i.e. one the dispatcher would actually spawn for).
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -1089,6 +1089,7 @@ class GatewayKanbanWatchersMixin:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
+            ready_boards: set[str] = set()
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -1099,9 +1100,9 @@ class GatewayKanbanWatchersMixin:
                 try:
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
+                        ready_boards.add(slug)
+                    elif _kb.has_spawnable_review(conn):
+                        ready_boards.add(slug)
                 except Exception:
                     continue
                 finally:
@@ -1110,7 +1111,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return ready_boards
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1250,9 +1251,27 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                # Health telemetry (board-local: each board is independently
+                # assessed for stuck state so a cap/lock/guard on board A doesn't
+                # mask genuinely stuck work on board B).
+                ready_boards = await asyncio.to_thread(_boards_with_spawnable)
+                deferred_slugs = {
+                    slug for slug, res in (results or [])
+                    if res is not None and (
+                        getattr(res, "skipped_global_capped", False)
+                        or bool(getattr(res, "skipped_per_profile_capped", ()))
+                        or bool(getattr(res, "skipped_locked", False))
+                        or bool(getattr(res, "respawn_guarded", ()))
+                    )
+                }
+                spawned_slugs = {
+                    slug for slug, res in (results or [])
+                    if res is not None and getattr(res, "spawned", None)
+                }
+                # A board is genuinely stuck if it has ready work, didn't spawn,
+                # and isn't intentionally deferred.
+                stuck = ready_boards - deferred_slugs - spawned_slugs
+                if stuck:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0
