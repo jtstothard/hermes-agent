@@ -26,6 +26,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 from agent.turn_retry_state import TurnRetryState
 from run_agent import AIAgent
 
@@ -287,6 +289,86 @@ class TestFallbackChainResetOnTransportRecovery:
             ("zai", "glm-4.7"),
         ]
         mock_resolve.assert_called_once()
+        assert agent._fallback_activated is True
+        assert agent.model == "glm-4.7"
+
+
+class UpstreamServiceUnavailable(Exception):
+    status_code = 503
+
+    def __init__(self):
+        super().__init__("upstream service unavailable")
+        self.response = SimpleNamespace(headers={})
+
+
+class TestFastUpstreamFailureFallback:
+    """Fallback must activate after fast upstream failures, not only timeouts."""
+
+    def test_http_503_then_transport_failure_activates_fallback(self):
+        fb_chain = [
+            {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+            }
+        ]
+        agent = _make_agent_with_fallback(fb_chain)
+        agent._api_max_retries = 3
+        calls = []
+        failures = [
+            UpstreamServiceUnavailable(),
+            httpx.ReadTimeout(
+                "connection reset",
+                request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+            ),
+        ]
+
+        def fake_api_call(api_kwargs):
+            calls.append((agent.provider, agent.model))
+            if failures:
+                raise failures.pop(0)
+            return _mock_response("Recovered via fallback")
+
+        mock_fb_client = MagicMock()
+        mock_fb_client.api_key = "primary-key-abcdef12"
+        mock_fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+        mock_fb_client._custom_headers = None
+        mock_fb_client.default_headers = None
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "glm-4.7"),
+            ) as mock_resolve,
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via fallback"
+        assert calls == [
+            ("zai", "glm-5.1"),
+            ("zai", "glm-5.1"),
+            ("zai", "glm-4.7"),
+        ]
+        mock_resolve.assert_called_once_with(
+            "zai",
+            model="glm-4.7",
+            raw_codex=True,
+            explicit_base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+            explicit_api_key=None,
+        )
+        assert agent.client is mock_fb_client
         assert agent._fallback_activated is True
         assert agent.model == "glm-4.7"
 
