@@ -826,11 +826,14 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            # See #61521: self-correcting deny message steers the model toward permitted tools.
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
-                    "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    "{tool} is not available in review — "
+                    "use `skill_view` to read a skill, "
+                    "`skill_manage(action='patch', …)` to change one, "
+                    "and `memory` for notes."
                 ),
             )
             try:
