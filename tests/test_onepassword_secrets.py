@@ -81,6 +81,7 @@ def test_validate_references_filters_bad_names_and_refs():
 def test_fetch_happy_path(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "fake-token")
     values = {
         "op://Private/OpenAI/api key": "sk-abc\n",
         "op://Private/Anthropic/credential": "sk-ant-xyz",
@@ -146,6 +147,7 @@ def test_fetch_empty_rc0_does_not_clobber(monkeypatch, tmp_path):
 def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "fake-token")
     monkeypatch.setattr(
         op.subprocess, "run", lambda *a, **k: _err(1, "\x1b[31m[ERROR] not signed in\x1b[0m")
     )
@@ -164,6 +166,7 @@ def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
 def test_fetch_one_bad_one_good(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "fake-token")
 
     def fake_run(cmd, **kwargs):
         ref = cmd[cmd.index("--") + 1]

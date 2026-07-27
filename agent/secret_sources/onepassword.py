@@ -333,6 +333,21 @@ def fetch_onepassword_secrets(
         return {}, warnings
 
     token_value = os.environ.get(token_env, "").strip()
+    
+    # Guard for unauthenticated 1Password configuration: warn early if there's
+    # no auth material (token or interactive session) but op:// refs are present.
+    # This prevents silent failures and cryptic "not signed in" errors later.
+    if not token_value:
+        has_session = any(key.startswith("OP_SESSION_") for key in os.environ)
+        if not has_session and valid:
+            warnings.append(
+                f"1Password is configured (secrets.onepassword.enabled=true with "
+                f"{len(valid)} op:// reference{'s' if len(valid) != 1 else ''}), "
+                f"but no authentication is available. Set {token_env} in .env "
+                f"or ensure an interactive op session is active (OP_SESSION_*). "
+                f"Secrets will not be resolved."
+            )
+    
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",
