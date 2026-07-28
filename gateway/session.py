@@ -2313,6 +2313,7 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        superseded_resume_reason: Optional[str] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2348,6 +2349,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2363,6 +2365,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2442,7 +2445,12 @@ class SessionStore:
             # Use the specific reset reason so state.db is auditable (e.g.
             # "resume_pending_expired" is distinguishable from a normal
             # "session_reset" caused by idle/daily expiry).
-            _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
+            # If the superseded session had resume_reason="restart_interrupted",
+            # mark it as crash_interrupted so it's recoverable.
+            if superseded_resume_reason == "restart_interrupted":
+                _db_end_reason = "crash_interrupted"
+            else:
+                _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
             try:
                 # promote_to_session_reset, not end_session: the row may
                 # already be ended with a recoverable accidental reason
@@ -2706,29 +2714,9 @@ class SessionStore:
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
                     count += 1
-                    # Mark the session as crash_interrupted in the DB so it's
-                    # recoverable via find_latest_gateway_session_for_peer()
-                    self._mark_crash_interrupted_in_db(entry.session_id)
             if count:
                 self._save()
         return count
-
-    def _mark_crash_interrupted_in_db(self, session_id: str) -> None:
-        """Mark a session as crash-interrupted in state.db.
-
-        Called during crash recovery (suspend_recently_active) to set
-        end_reason='crash_interrupted' so the session is recoverable via
-        find_latest_gateway_session_for_peer() and not pruned from sessions.json.
-        """
-        if self._db:
-            try:
-                self._db.end_session(session_id, "crash_interrupted")
-            except Exception as e:
-                logger.debug(
-                    "gateway.session: failed to mark %s as crash_interrupted: %s",
-                    session_id,
-                    e,
-                )
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

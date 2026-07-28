@@ -142,26 +142,3 @@ class TestCrashInterruptedRecovery:
         store._prune_stale_sessions_locked()
 
         assert "idle_key" not in store._entries, "idle-timeout session_reset should be pruned"
-
-    def test_suspend_recently_active_marks_crash_interrupted(self, tmp_path):
-        """suspend_recently_active should mark sessions as crash_interrupted in DB."""
-        db = MagicMock()
-        db.end_session = MagicMock()
-
-        now = datetime.now()
-        recent_entry = _make_entry("recent_key", "sid_recent", updated_at=now - timedelta(seconds=30))
-        old_entry = _make_entry("old_key", "sid_old", updated_at=now - timedelta(hours=2))
-
-        store = _make_store_with_db(tmp_path, db)
-        store._entries["recent_key"] = recent_entry
-        store._entries["old_key"] = old_entry
-
-        count = store.suspend_recently_active(max_age_seconds=120)
-
-        assert count == 1, "Only recent session should be suspended"
-        assert recent_entry.resume_pending is True
-        assert recent_entry.resume_reason == "restart_interrupted"
-        assert old_entry.resume_pending is False, "Old session should not be suspended"
-
-        # Verify crash_interrupted was set in DB for recent session only
-        db.end_session.assert_called_once_with("sid_recent", "crash_interrupted")
