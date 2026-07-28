@@ -1214,6 +1214,28 @@ class SessionStore:
                         recovered_keys += 1
                         continue
 
+                    # Crash-interrupted sessions are recoverable even when the
+                    # durable lookup returns the same session. Reopen the DB row
+                    # and retain the routing entry so /resume can see it.
+                    if row["end_reason"] == "crash_interrupted":
+                        try:
+                            db.reopen_session(entry.session_id)
+                        except Exception as exc:
+                            logger.debug(
+                                "gateway.session: failed to reopen crash-interrupted "
+                                "session %s: %s",
+                                entry.session_id,
+                                exc,
+                            )
+                        else:
+                            logger.info(
+                                "gateway.session: retained crash-interrupted entry "
+                                "%r -> %s",
+                                key,
+                                entry.session_id,
+                            )
+                            continue
+
                     logger.warning(
                         "gateway.session: pruning stale sessions.json entry "
                         "%r -> %s (end_reason=%r); left by a crashed gateway",
@@ -2230,6 +2252,10 @@ class SessionStore:
         the next incoming message on the same session_key auto-resumes from
         the existing transcript.
 
+        Also marks these sessions in the state.db with ``end_reason='crash_interrupted'``
+        so they can be distinguished from intentional /new or idle-timeout resets
+        (#71916).
+
         Entries already flagged ``resume_pending=True`` are skipped.  Entries
         explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
         are also skipped.  Terminal escalation for genuinely stuck sessions
@@ -2242,6 +2268,8 @@ class SessionStore:
 
         cutoff = _now() - timedelta(seconds=max_age_seconds)
         count = 0
+        db = getattr(self, "_db", None)
+        marked_entries = []
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
@@ -2251,9 +2279,24 @@ class SessionStore:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
-                    count += 1
+                    marked_entries.append(entry)
+            count = len(marked_entries)
             if count:
                 self._save()
+        # Mark sessions in the state.db with crash_interrupted so they can be
+        # distinguished from intentional resets (#71916). Do this outside the lock
+        # to avoid holding it while doing DB writes, and after the save() so
+        # sessions.json is durable before we touch the DB.
+        if marked_entries and db:
+            for entry in marked_entries:
+                try:
+                    db.end_session(entry.session_id, "crash_interrupted")
+                except Exception as e:
+                    logger.debug(
+                        "gateway.session: failed to end session %s with crash_interrupted: %s",
+                        entry.session_id,
+                        e,
+                    )
         return count
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:

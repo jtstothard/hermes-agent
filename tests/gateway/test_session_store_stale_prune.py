@@ -232,3 +232,47 @@ class TestEnsureLoadedCallsPrune:
         store._ensure_loaded()
 
         assert "active_key" in store._entries
+
+    def test_crash_interrupted_entry_survives_load(self, tmp_path):
+        """Sessions with end_reason=crash_interrupted should not be pruned (#71916)."""
+        entry = _make_entry("crash_key", "sid_crash")
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({"crash_key": entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+        # Mark as crash_interrupted in the DB
+        db = _db_returning({
+            "sid_crash": {"end_reason": "crash_interrupted", "id": "sid_crash"}
+        })
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = db
+
+        store._ensure_loaded()
+
+        # Entry should NOT be pruned because crash_interrupted is recoverable
+        assert "crash_key" in store._entries
+        # reopen_session should have been called to make the session live again
+        db.reopen_session.assert_called_once_with("sid_crash")
+
+    def test_session_reset_entry_pruned(self, tmp_path):
+        """Sessions with end_reason=session_reset should still be pruned.
+
+        This ensures the fix doesn't accidentally make ALL session_reset rows
+        recoverable — only crash_interrupted ones.
+        """
+        entry = _make_entry("reset_key", "sid_reset")
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({"reset_key": entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+        # Mark as session_reset (intentional /new)
+        db = _db_returning({
+            "sid_reset": {"end_reason": "session_reset", "id": "sid_reset"}
+        })
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = db
+
+        store._ensure_loaded()
+
+        # Entry SHOULD be pruned because session_reset is not recoverable
+        assert "reset_key" not in store._entries
