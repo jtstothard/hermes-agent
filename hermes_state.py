@@ -4252,7 +4252,7 @@ class SessionDB:
                 SELECT * FROM sessions
                 WHERE session_key = ?
                   AND source = ?
-                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap', 'crash_interrupted'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -4277,7 +4277,7 @@ class SessionDB:
                   AND COALESCE(chat_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
-                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap', 'crash_interrupted'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))

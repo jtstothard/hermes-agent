@@ -1351,13 +1351,22 @@ class SessionStore:
 
         stale_keys: list = []
         recovered_keys = 0
+        # Recoverable end_reason values: sessions ended this way should be kept in sessions.json
+        # because they represent crash interruptions that are still recoverable.
+        _RECOVERABLE_END_REASONS = frozenset(("crash_interrupted",))
         try:
             for key, entry in self._entries.items():
                 row = db.get_session(entry.session_id)
                 # row is None        -> not in DB (legacy / pre-SQLite) — keep
                 # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
+                # end_reason not None -> session ended — maybe prune
                 if row is not None and row.get("end_reason") is not None:
+                    end_reason = row["end_reason"]
+                    # Keep entries with recoverable end_reasons — crash-interrupted sessions
+                    # should remain in the /resume list and be recoverable on restart.
+                    if end_reason in _RECOVERABLE_END_REASONS:
+                        continue
+
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -2697,9 +2706,29 @@ class SessionStore:
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
                     count += 1
+                    # Mark the session as crash_interrupted in the DB so it's
+                    # recoverable via find_latest_gateway_session_for_peer()
+                    self._mark_crash_interrupted_in_db(entry.session_id)
             if count:
                 self._save()
         return count
+
+    def _mark_crash_interrupted_in_db(self, session_id: str) -> None:
+        """Mark a session as crash-interrupted in state.db.
+
+        Called during crash recovery (suspend_recently_active) to set
+        end_reason='crash_interrupted' so the session is recoverable via
+        find_latest_gateway_session_for_peer() and not pruned from sessions.json.
+        """
+        if self._db:
+            try:
+                self._db.end_session(session_id, "crash_interrupted")
+            except Exception as e:
+                logger.debug(
+                    "gateway.session: failed to mark %s as crash_interrupted: %s",
+                    session_id,
+                    e,
+                )
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
