@@ -1401,6 +1401,48 @@ class SessionStore:
                         recovered_keys += 1
                         continue
 
+                    # Belt-and-braces: a session_reset ended within the crash
+                    # window (5 min before this boot) was almost certainly killed
+                    # by the same SIGTERM/fsfreeze chain that crash recovery
+                    # catches for live sessions, but never received the marker
+                    # because the gateway was killed mid-drain before
+                    # suspend_recently_active() could run.  Preserve it for
+                    # /resume recovery rather than pruning — the session had
+                    # real conversation history that would otherwise vanish
+                    # from the numbered /resume list.
+                    end_reason = row.get("end_reason")
+                    if end_reason == "session_reset":
+                        ended_at_raw = row.get("ended_at") or row.get("updated_at")
+                        if ended_at_raw is not None:
+                            try:
+                                from datetime import timedelta as _td, timezone
+                                ended_at = None
+                                # The DB schema stores ended_at as a REAL unix
+                                # timestamp (float).  String handling is legacy-
+                                # only for migrated/pre-SQLite entries; the float
+                                # path covers 100% of current production reads.
+                                if isinstance(ended_at_raw, (int, float)):
+                                    ended_at = datetime.fromtimestamp(float(ended_at_raw))
+                                elif isinstance(ended_at_raw, str):
+                                    _parsed = datetime.fromisoformat(
+                                        ended_at_raw.replace("Z", "+00:00")
+                                    )
+                                    if _parsed.tzinfo is not None:
+                                        _parsed = _parsed.astimezone(
+                                            timezone.utc
+                                        ).replace(tzinfo=None)
+                                    ended_at = _parsed
+                                if ended_at is not None and (_now() - ended_at) < _td(minutes=5):
+                                    logger.info(
+                                        "gateway.session: preserving session_reset entry "
+                                        "%r -> %s (ended %ss ago, within crash window)",
+                                        key, entry.session_id,
+                                        int((_now() - ended_at).total_seconds()),
+                                    )
+                                    continue
+                            except (ValueError, TypeError, OSError):
+                                pass  # parsing failed — fall through to prune
+
                     logger.warning(
                         "gateway.session: pruning stale sessions.json entry "
                         "%r -> %s (end_reason=%r); left by a crashed gateway",
