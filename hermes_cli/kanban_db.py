@@ -8885,8 +8885,23 @@ def retired_assignees(kanban_cfg: Optional[dict] = None) -> frozenset[str]:
             kanban_cfg = {}
     raw = (kanban_cfg or {}).get("retired_assignees") or []
     if isinstance(raw, str):
-        # Tolerate a single bare name; normalize like a one-item list.
-        raw = [raw]
+        # A CLI-written value can arrive as a JSON-encoded list string
+        # (e.g. '["coder"]' from `hermes config set`). Try to decode it;
+        # fall back to treating the whole string as a single bare name.
+        candidate = raw.strip()
+        if candidate.startswith("[") and candidate.endswith("]"):
+            try:
+                import json
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list):
+                    raw = parsed
+                else:
+                    raw = [raw]
+            except Exception:
+                raw = [raw]
+        else:
+            # Tolerate a single bare name; normalize like a one-item list.
+            raw = [raw]
     return frozenset(
         str(name).strip() for name in raw if str(name).strip()
     )
