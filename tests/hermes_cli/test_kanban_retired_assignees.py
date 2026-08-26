@@ -316,6 +316,15 @@ def test_config_key_read_and_documented():
     assert kanban_db.retired_assignees(kanban_cfg={}) == frozenset()
     # A single bare string is tolerated and normalized.
     assert kanban_db.retired_assignees(kanban_cfg={"retired_assignees": "coder"}) == frozenset({"coder"})
+    # A CLI-written JSON-array string (e.g. `hermes config set
+    # kanban.retired_assignees '["coder"]'`) must decode, not be treated
+    # as one bogus profile name (live-config regression, 2026-08-26).
+    assert kanban_db.retired_assignees(
+        kanban_cfg={"retired_assignees": '["coder"]'}
+    ) == frozenset({"coder"})
+    assert kanban_db.retired_assignees(
+        kanban_cfg={"retired_assignees": '["coder", "ghost"]'}
+    ) == frozenset({"coder", "ghost"})
 
     # The key must be documented in config_defaults so an unpatched install
     # can't silently no-op (the exact failure mode this feature closes).
