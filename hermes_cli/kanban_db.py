@@ -2954,6 +2954,17 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Reject creating a task directly on a retired profile: the card
+    # would only ever be skipped by the dispatcher (kanban.
+    # retired_assignees), so an explicit creation targeting one is a
+    # routing error. Historical cards already assigned to a retired
+    # profile are untouched — this only blocks NEW cards.
+    if assignee and assignee in retired_assignees():
+        raise ValueError(
+            f"cannot create task: assignee {assignee!r} is retired "
+            f"(kanban.retired_assignees). Assign to a live profile or "
+            f"leave unassigned for kanban.default_assignee."
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3410,8 +3421,19 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
+
+    Assigning to a profile in ``kanban.retired_assignees`` raises
+    ``ValueError`` — a retired assignee can never spawn, so an explicit
+    new assignment to one is a routing error, not a preference. Existing
+    historical cards keep their retired assignee (the dispatcher simply
+    skips them); this guard only blocks *new* assignments.
     """
     profile = _canonical_assignee(profile)
+    if profile and profile in retired_assignees():
+        raise ValueError(
+            f"cannot assign {task_id}: profile {profile!r} is retired "
+            f"(kanban.retired_assignees). Reassign to a live profile."
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -6743,6 +6765,13 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Default per-parent concurrent child cap (``kanban.max_spawns_per_parent``).
+# Prevents a single parent task from monopolizing the global worker budget
+# by spawning unbounded children — the root cause of the 35-duplicate-RMAB
+# storm (every retry spawned a fresh fan-out instead of waiting for the
+# children already in flight to complete). Set to ``None`` (or 0) to disable.
+DEFAULT_MAX_SPAWNS_PER_PARENT = 3
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -6820,6 +6849,26 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_per_parent_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks deferred this tick because at least one of their parents
+    already has ``kanban.max_spawns_per_parent`` children running.
+    Each entry is ``(task_id, parent_id, current_running_children)``.
+    The task is NOT blocked — it will be picked up on a subsequent tick
+    once an in-flight sibling completes and frees capacity under the
+    parent. Prevents worker storms from a single fan-out root (the
+    35-duplicate-RMAB root cause)."""
+    skipped_retired: list[str] = field(default_factory=list)
+    """Task ids skipped because their assignee is in
+    ``kanban.retired_assignees``. Retirement is a *dispatch-level* block:
+    the profile directory may still exist on disk (so the task stays
+    visible and queryable), but the dispatcher must never spawn a worker
+    for it. Retries, reclaims, and dependency promotion all re-enter the
+    ready/review loops and hit this same gate, so they cannot bypass it.
+    Distinct from ``skipped_nonspawnable`` (assignee names a control-plane
+    lane) and ``skipped_unassigned`` (no assignee at all) — this bucket is
+    operator-actionable only via removing the assignee from
+    ``kanban.retired_assignees`` or reassigning the task to a live
+    profile."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8170,7 +8219,14 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
+    # Retired assignees are deliberately non-spawnable by policy, so a
+    # backlog of ready tasks assigned to them is "correctly idle" (the
+    # dispatcher will skip them every tick), not a stuck condition.
+    # Excluding them here keeps the health warning honest.
+    _retired = retired_assignees()
     for row in rows:
+        if row["assignee"] in _retired:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -8195,7 +8251,12 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         return True
+    # See has_spawnable_ready: retired assignees are non-spawnable by
+    # policy, not a stuck condition.
+    _retired = retired_assignees()
     for row in rows:
+        if row["assignee"] in _retired:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -8214,6 +8275,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_spawns_per_parent: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8248,6 +8310,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawns_per_parent=max_spawns_per_parent,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8264,6 +8327,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawns_per_parent=max_spawns_per_parent,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8284,6 +8348,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_spawns_per_parent: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8308,6 +8373,13 @@ def _dispatch_once_locked(
     intent ("limit concurrent kanban tasks"). With a per-tick interpretation
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
+
+    ``max_spawns_per_parent`` adds a **per-parent** concurrency cap on top
+    of the global ``max_spawn``: no single parent task may have more than N
+    children running at once, even if the global cap has headroom. Prevents
+    a single fan-out root from monopolizing the worker budget (root cause
+    of the 35-duplicate-RMAB storm). Deferred tasks land in
+    ``skipped_per_parent_capped`` and are picked up once a sibling completes.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -8397,15 +8469,60 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Retired assignees (``kanban.retired_assignees``): resolved once per
+    # tick. A retired assignee is never spawned — even when its profile
+    # directory exists — because retirement is a dispatch-level policy,
+    # not a filesystem state (a directory rename-back would otherwise
+    # silently resurrect the profile, which is exactly the failure this
+    # guard exists to prevent). Historical tasks keep their assignee and
+    # stay visible; they simply never spawn and never trip health
+    # telemetry as "stuck".
+    _retired = retired_assignees()
+    # Per-parent concurrent-child cap (``kanban.max_spawns_per_parent``).
+    # Like the per-profile cap above, this counts tasks already in
+    # ``status='running'`` against the limit so it enforces *live*
+    # concurrency rather than a per-tick spawn budget. We pre-compute a
+    # parent_id -> running-children map once per tick and increment it as
+    # we spawn within this loop (same pattern as _per_profile_running).
+    # Tasks deferred this way land in ``skipped_per_parent_capped`` — they
+    # are NOT blocked and will be picked up once an in-flight sibling
+    # completes and frees capacity under the parent.
+    _per_parent_cap = max_spawns_per_parent if (
+        isinstance(max_spawns_per_parent, int)
+        and max_spawns_per_parent > 0
+    ) else None
+    _per_parent_running: dict[str, int] = {}
+    if _per_parent_cap is not None:
+        for prow in conn.execute(
+            "SELECT l.parent_id AS parent_id, COUNT(*) AS n "
+            "FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id "
+            "WHERE t.status = 'running' "
+            "GROUP BY l.parent_id"
+        ):
+            _per_parent_running[prow["parent_id"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
+        # A retired default_assignee can never apply: the dispatcher
+        # would only ever skip its auto-assigned tasks as skipped_retired.
+        # Treat it as unset and log a warning so the operator notices the
+        # misconfiguration instead of wondering why default-assigned tasks
+        # never spawn.
+        if _default_assignee in _retired:
+            _log.warning(
+                "kanban dispatch: default_assignee=%r is in "
+                "kanban.retired_assignees — ignoring it this tick; "
+                "reassign the default or un-retire the profile",
+                _default_assignee,
+            )
+            _default_assignee = None
         try:
             from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _default_assignee_resolved = bool(_pe(_default_assignee)) if _default_assignee else False
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
@@ -8460,6 +8577,20 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Retired assignees never spawn — even if the profile directory
+        # exists. Retirement is a dispatch-level block (kanban.
+        # retired_assignees), independent of filesystem state, so a
+        # renamed-back or re-imported profile directory cannot silently
+        # resurrect spawnability. Historical cards keep their assignee;
+        # they stay visible and non-spawnable until reassigned or
+        # un-retired. Bucketed separately so telemetry can distinguish
+        # "retired by policy" from "no such profile" / "no assignee".
+        # This check runs BEFORE profile_exists so a retired profile
+        # whose directory was also removed still lands in the retired
+        # bucket (the more specific diagnosis).
+        if row_assignee in _retired:
+            result.skipped_retired.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -8496,6 +8627,26 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Per-parent concurrent-child cap: refuse to spawn if ANY parent
+        # of this task already has ``max_spawns_per_parent`` children
+        # running. Prevents a single fan-out root from monopolizing the
+        # global worker budget (root cause of the 35-duplicate-RMAB
+        # storm). The task defers to the next tick — it is NOT blocked.
+        if _per_parent_cap is not None:
+            _row_parents = parent_ids(conn, row["id"])
+            _capped_parent = None
+            _capped_count = 0
+            for _pid in _row_parents:
+                _pcount = _per_parent_running.get(_pid, 0)
+                if _pcount >= _per_parent_cap:
+                    _capped_parent = _pid
+                    _capped_count = _pcount
+                    break
+            if _capped_parent is not None:
+                result.skipped_per_parent_capped.append(
+                    (row["id"], _capped_parent, _capped_count)
+                )
+                continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -8527,6 +8678,14 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            # Same dry_run accounting for the per-parent cap: increment
+            # each parent's running-children count so subsequent iterations
+            # in this same tick see the would-be spawn against the cap.
+            if _per_parent_cap is not None:
+                for _pid in parent_ids(conn, row["id"]):
+                    _per_parent_running[_pid] = (
+                        _per_parent_running.get(_pid, 0) + 1
+                    )
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8582,6 +8741,15 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            # Track the new in-flight child count for each parent so
+            # later iterations in this same tick respect the per-parent
+            # cap (``max_spawns_per_parent``). Subsequent ticks re-query
+            # from the DB.
+            if _per_parent_cap is not None:
+                for _pid in parent_ids(conn, claimed.id):
+                    _per_parent_running[_pid] = (
+                        _per_parent_running.get(_pid, 0) + 1
+                    )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8609,6 +8777,15 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        # Retired assignees never spawn review agents either — same
+        # dispatch-level policy as the ready loop. A review task assigned
+        # to a retired profile stays in 'review', visible and intact,
+        # but is never claimed for review by the dispatcher. Runs before
+        # profile_exists so retired+missing also lands in the retired
+        # bucket.
+        if row["assignee"] in _retired:
+            result.skipped_retired.append(row["id"])
             continue
         try:
             from hermes_cli.profiles import profile_exists
@@ -8679,6 +8856,40 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def retired_assignees(kanban_cfg: Optional[dict] = None) -> frozenset[str]:
+    """Return the normalized set of retired assignees from config.
+
+    Reads ``kanban.retired_assignees`` (a list of profile names). Retired
+    assignees are *never* spawned by the dispatcher, even when their
+    profile directory exists on disk — retirement is a dispatch-level
+    block, not a filesystem state. Historical tasks may keep a retired
+    assignee (they remain visible and queryable); only new spawns and new
+    explicit assignments are blocked.
+
+    An empty set means "no retirement" — the historical default, so an
+    install without the key behaves exactly as before. The key is
+    documented in ``config_defaults.py``; an unrecognized key would be a
+    silent no-op, which is why the helper returns a set that is empty by
+    default and why callers never guess at unknown keys.
+
+    ``kanban_cfg`` may be passed in (tests) to avoid a config reload.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = load_config().get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+    raw = (kanban_cfg or {}).get("retired_assignees") or []
+    if isinstance(raw, str):
+        # Tolerate a single bare name; normalize like a one-item list.
+        raw = [raw]
+    return frozenset(
+        str(name).strip() for name in raw if str(name).strip()
+    )
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:

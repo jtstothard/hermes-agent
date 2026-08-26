@@ -2280,6 +2280,17 @@ DEFAULT_CONFIG = {
         # decomposer prompt, model, or skills; configure that LLM path under
         # auxiliary.kanban_decomposer.
         "orchestrator_profile": "",
+        # Profiles that must never be spawned by the dispatcher. Retirement
+        # is a dispatch-level block, independent of filesystem state: a
+        # retired profile whose directory still exists (or gets renamed
+        # back / re-imported) is still never spawned. Historical tasks may
+        # keep a retired assignee — they remain visible and queryable and
+        # simply stay non-spawnable — but creating a new task on a retired
+        # profile, assigning/reassigning to one, or configuring one as
+        # default_assignee is rejected. Removing a profile from this list
+        # restores normal spawnability immediately. Empty list = no
+        # retirement (the historical default). See kanban_db.retired_assignees.
+        "retired_assignees": [],
         # Where a child task lands if the orchestrator can't match an
         # assignee to any installed profile. When unset, falls back to the
         # default profile. A task never ends up with assignee=None.
@@ -2293,6 +2304,16 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-parent concurrent-child cap. When set to a positive int,
+        # no single parent task may have more than N children running at
+        # once, even if the global max_in_progress / max_spawn caps would
+        # allow it. Tasks blocked this way defer to the next dispatcher
+        # tick (they are NOT blocked — just waiting for sibling capacity).
+        # Prevents a single fan-out root from monopolizing the worker
+        # budget (root cause of the 35-duplicate-RMAB storm). Default 3
+        # is conservative; raise it for legitimate wide fan-outs or set
+        # to null/0 to disable.
+        "max_spawns_per_parent": 3,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
