@@ -571,8 +571,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
-    with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    except ValueError as exc:
+        # Includes retired-assignee rejection: assigning to a profile in
+        # kanban.retired_assignees is a routing error, surfaced clearly
+        # rather than accepted as a no-op.
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -1131,6 +1137,344 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                                lambda tid: f"cannot delete {tid} (must already be archived)")
         return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+
+
+def _cmd_tail(args: argparse.Namespace) -> int:
+    last_id = 0
+    print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
+    try:
+        while True:
+            with kb.connect_closing() as conn:
+                events = kb.list_events(conn, args.task_id)
+            for e in events:
+                if e.id > last_id:
+                    pl = f" {e.payload}" if e.payload else ""
+                    print(f"[{_fmt_ts(e.created_at)}] {e.kind}{pl}", flush=True)
+                    last_id = e.id
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        return 0
+
+
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    # Honour kanban.default_assignee as the fallback for unassigned ready
+    # tasks (#27145), kanban.max_in_progress as the global concurrency cap
+    # (#33488), kanban.max_in_progress_per_profile as the per-profile
+    # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
+    # (#28805). Same semantics as the gateway dispatch path so behavior
+    # matches whether the user runs the CLI directly or relies on the
+    # gateway-embedded dispatcher.
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+
+        def _coerce_positive_int(value):
+            if value is None:
+                return None
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                return None
+            return ival if ival >= 1 else None
+
+        max_in_progress_per_profile = _coerce_positive_int(
+            _kanban_cfg.get("max_in_progress_per_profile")
+        )
+        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        # Per-parent concurrent-child cap: no single parent task may have
+        # more than N children running at once. Defaulted to 3 in
+        # config_defaults; read here so the CLI honours operator overrides.
+        max_spawns_per_parent = _coerce_positive_int(
+            _kanban_cfg.get("max_spawns_per_parent")
+        )
+        # CLI --max overrides config kanban.max_spawn when both are present;
+        # CLI is the more explicit signal so it wins.
+        cli_max = getattr(args, "max", None)
+        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
+            _kanban_cfg.get("max_spawn")
+        )
+    except Exception:
+        default_assignee = None
+        max_in_progress_per_profile = None
+        max_in_progress = None
+        max_spawns_per_parent = None
+        max_spawn = getattr(args, "max", None)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            dry_run=args.dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            max_spawns_per_parent=max_spawns_per_parent,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "reclaimed": res.reclaimed,
+            "crashed": res.crashed,
+            "timed_out": res.timed_out,
+            "stale": res.stale,
+            "auto_blocked": res.auto_blocked,
+            "promoted": res.promoted,
+            "spawned": [
+                {"task_id": tid, "assignee": who, "workspace": ws}
+                for (tid, who, ws) in res.spawned
+            ],
+            "skipped_unassigned": res.skipped_unassigned,
+            "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_retired": res.skipped_retired,
+            "skipped_per_profile_capped": [
+                {"task_id": tid, "assignee": who, "current": current}
+                for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_per_parent_capped": [
+                {"task_id": tid, "parent_id": pid, "current": current}
+                for (tid, pid, current) in res.skipped_per_parent_capped
+            ],
+            "auto_assigned_default": res.auto_assigned_default,
+        }, indent=2))
+        return 0
+    print(f"Reclaimed:    {res.reclaimed}")
+    print(f"Crashed:      {len(res.crashed)}")
+    if res.crashed:
+        print(f"  {', '.join(res.crashed)}")
+    print(f"Timed out:    {len(res.timed_out)}")
+    if res.timed_out:
+        print(f"  {', '.join(res.timed_out)}")
+    print(f"Stale:        {len(res.stale)}")
+    if res.stale:
+        print(f"  {', '.join(res.stale)}")
+    print(f"Auto-blocked: {len(res.auto_blocked)}")
+    if res.auto_blocked:
+        print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Promoted:     {res.promoted}")
+    print(f"Spawned:      {len(res.spawned)}")
+    for tid, who, ws in res.spawned:
+        tag = " (dry)" if args.dry_run else ""
+        print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.auto_assigned_default:
+        print(
+            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+            f"{', '.join(res.auto_assigned_default)}"
+        )
+    if res.skipped_unassigned:
+        print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.skipped_per_profile_capped:
+        for tid, who, current in res.skipped_per_profile_capped:
+            print(
+                f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_per_parent_capped:
+        for tid, pid, current in res.skipped_per_parent_capped:
+            print(
+                f"Deferred (parent {pid} at per-parent cap, {current} children running): {tid}"
+            )
+    if res.skipped_nonspawnable:
+        print(
+            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_retired:
+        print(
+            f"Skipped (retired assignee — kanban.retired_assignees): "
+            f"{', '.join(res.skipped_retired)}"
+        )
+    return 0
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    """Deprecated — the dispatcher now runs inside the gateway.
+
+    Left in as a stub so users with the old command in scripts/systemd
+    units get a clear migration message instead of a cryptic
+    "no such command" error. A ``--force`` escape hatch keeps the old
+    standalone daemon alive for the rare edge case where someone truly
+    cannot run the gateway (e.g. running on a host that forbids
+    long-lived background services), but the default path exits 2
+    with guidance so nobody accidentally keeps running two dispatchers
+    against the same kanban.db.
+    """
+    # --force lets power users keep the standalone loop for one more
+    # release cycle. Undocumented in `--help` so nobody discovers it
+    # casually — intentional.
+    if not getattr(args, "force", False):
+        print(
+            "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
+            "inside the gateway. To use kanban:\n"
+            "\n"
+            "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
+            "\n"
+            "Ready tasks will be picked up on the next dispatcher tick\n"
+            "(default: every 60 seconds). Configure via config.yaml:\n"
+            "\n"
+            "    kanban:\n"
+            "      dispatch_in_gateway: true      # default\n"
+            "      dispatch_interval_seconds: 60\n"
+            "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
+            "\n"
+            "Running both the gateway AND this standalone daemon will\n"
+            "race for claims. If you truly need the old standalone\n"
+            "daemon (no gateway available), rerun with --force.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Legacy path — same logic as before, kept behind --force.
+    # Make sure the DB exists before printing "started" so the user sees the
+    # correct DB path and any init error surfaces immediately.
+    kb.init_db()
+
+    pidfile = getattr(args, "pidfile", None)
+    if pidfile:
+        try:
+            Path(pidfile).parent.mkdir(parents=True, exist_ok=True)
+            Path(pidfile).write_text(str(os.getpid()), encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not write pidfile {pidfile}: {exc}", file=sys.stderr)
+
+    verbose = bool(getattr(args, "verbose", False))
+    print(
+        f"Kanban dispatcher running STANDALONE via --force "
+        f"(interval={args.interval}s, pid={os.getpid()}). "
+        f"Ctrl-C to stop. NOTE: if a gateway is also running with "
+        f"dispatch_in_gateway=true (default), you have two dispatchers "
+        f"racing for claims.",
+        file=sys.stderr,
+    )
+
+    # Health telemetry: warn when every tick finds ready work but fails to
+    # spawn any worker. Catches broken profiles, PATH drift, missing venv,
+    # credential loss — cases where the per-task circuit breaker auto-blocks
+    # each task quietly but the operator has no signal that the dispatcher
+    # itself is dysfunctional.
+    HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
+    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+
+    def _on_tick(res):
+        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        spawned_any = bool(res.spawned)
+        if ready_pending and not spawned_any:
+            health_state["bad_ticks"] += 1
+        else:
+            health_state["bad_ticks"] = 0
+        # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
+        # so log volume stays bounded while the problem persists.
+        if health_state["bad_ticks"] >= HEALTH_WINDOW:
+            now = int(time.time())
+            # Rate-limit repeats: at most one warning per 5 minutes.
+            if now - health_state["last_warn_at"] >= 300:
+                print(
+                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
+                    f"ready queue non-empty for {health_state['bad_ticks']} "
+                    f"consecutive ticks but 0 workers spawned successfully. "
+                    f"Check profile health (venv, PATH, credentials) and "
+                    f"`hermes kanban list --status ready` / "
+                    f"`hermes kanban list --status blocked` for recent "
+                    f"spawn_failed tasks.",
+                    file=sys.stderr, flush=True,
+                )
+                health_state["last_warn_at"] = now
+        if not verbose:
+            return
+        did_work = (
+            res.reclaimed or res.crashed or res.timed_out or res.promoted
+            or res.spawned or res.auto_blocked or res.stale
+        )
+        if did_work:
+            print(
+                f"[{_fmt_ts(int(time.time()))}] "
+                f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
+                f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
+                f"promoted={res.promoted} spawned={len(res.spawned)} "
+                f"auto_blocked={len(res.auto_blocked)}",
+                flush=True,
+            )
+
+    def _ready_queue_nonempty() -> bool:
+        """Cheap probe — is there at least one ready+assigned+unclaimed
+        task whose assignee maps to a real Hermes profile (i.e. one the
+        dispatcher would actually try to spawn for)?
+
+        Filters out tasks assigned to control-plane lanes
+        (e.g. ``orion-cc``, ``orion-research``) that are pulled by
+        terminals via ``claim_task`` directly — those are correctly idle
+        from the dispatcher's perspective, not stuck.
+        """
+        try:
+            with kb.connect_closing() as conn:
+                return kb.has_spawnable_ready(conn)
+        except Exception:
+            return False
+
+    try:
+        kb.run_daemon(
+            interval=args.interval,
+            max_spawn=args.max,
+            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            on_tick=_on_tick,
+        )
+    finally:
+        if pidfile:
+            try:
+                Path(pidfile).unlink()
+            except OSError:
+                pass
+    print("(dispatcher stopped)")
+    return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Live-stream task_events to the terminal."""
+    kinds = (
+        {k.strip() for k in args.kinds.split(",") if k.strip()}
+        if args.kinds else None
+    )
+    cursor = 0
+    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    # Seed cursor at the latest id so we don't replay history.
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+        ).fetchone()
+        cursor = int(row["m"])
+
+    try:
+        while True:
+            with kb.connect_closing() as conn:
+                rows = conn.execute(
+                    "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+                    "       t.assignee, t.tenant "
+                    "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+                    "WHERE e.id > ? ORDER BY e.id ASC LIMIT 200",
+                    (cursor,),
+                ).fetchall()
+            for r in rows:
+                cursor = max(cursor, int(r["id"]))
+                if kinds and r["kind"] not in kinds:
+                    continue
+                if args.assignee and r["assignee"] != args.assignee:
+                    continue
+                if args.tenant and r["tenant"] != args.tenant:
+                    continue
+                try:
+                    payload = json.loads(r["payload"]) if r["payload"] else None
+                except Exception:
+                    payload = None
+                pl = f" {payload}" if payload else ""
+                print(
+                    f"[{_fmt_ts(r['created_at'])}] {r['task_id']:10s} "
+                    f"{r['kind']:18s} (@{r['assignee'] or '-'}){pl}",
+                    flush=True,
+                )
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        return 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

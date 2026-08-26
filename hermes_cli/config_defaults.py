@@ -1905,8 +1905,20 @@ DEFAULT_CONFIG = {
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",
-        # Assignee when the orchestrator can't match one to an installed profile; "" = default
-        # profile. A task never ends up with assignee=None.
+        # Profiles that must never be spawned by the dispatcher. Retirement
+        # is a dispatch-level block, independent of filesystem state: a
+        # retired profile whose directory still exists (or gets renamed
+        # back / re-imported) is still never spawned. Historical tasks may
+        # keep a retired assignee — they remain visible and queryable and
+        # simply stay non-spawnable — but creating a new task on a retired
+        # profile, assigning/reassigning to one, or configuring one as
+        # default_assignee is rejected. Removing a profile from this list
+        # restores normal spawnability immediately. Empty list = no
+        # retirement (the historical default). See kanban_db.retired_assignees.
+        "retired_assignees": [],
+        # Where a child task lands if the orchestrator can't match an
+        # assignee to any installed profile. When unset, falls back to the
+        # default profile. A task never ends up with assignee=None.
         "default_assignee": "",
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
@@ -1932,8 +1944,20 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
-        # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
-        # decompose <id>` or the dashboard's Decompose button.
+        # Per-parent concurrent-child cap. When set to a positive int,
+        # no single parent task may have more than N children running at
+        # once, even if the global max_in_progress / max_spawn caps would
+        # allow it. Tasks blocked this way defer to the next dispatcher
+        # tick (they are NOT blocked — just waiting for sibling capacity).
+        # Prevents a single fan-out root from monopolizing the worker
+        # budget (root cause of the 35-duplicate-RMAB storm). Default 3
+        # is conservative; raise it for legitimate wide fan-outs or set
+        # to null/0 to disable.
+        "max_spawns_per_parent": 3,
+        # When true, the kanban dispatcher auto-runs the decomposer on
+        # tasks that land in Triage (every dispatcher tick). When false,
+        # decomposition is manual via `hermes kanban decompose <id>` or
+        # the dashboard's Decompose button.
         "auto_decompose": True,
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.

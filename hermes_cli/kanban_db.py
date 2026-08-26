@@ -1291,6 +1291,17 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Reject creating a task directly on a retired profile: the card
+    # would only ever be skipped by the dispatcher (kanban.
+    # retired_assignees), so an explicit creation targeting one is a
+    # routing error. Historical cards already assigned to a retired
+    # profile are untouched — this only blocks NEW cards.
+    if assignee and assignee in retired_assignees():
+        raise ValueError(
+            f"cannot create task: assignee {assignee!r} is retired "
+            f"(kanban.retired_assignees). Assign to a live profile or "
+            f"leave unassigned for kanban.default_assignee."
+        )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1551,8 +1562,20 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    Assigning to a profile in ``kanban.retired_assignees`` raises
+    ``ValueError`` — a retired assignee can never spawn, so an explicit
+    new assignment to one is a routing error, not a preference. Existing
+    historical cards keep their retired assignee (the dispatcher simply
+    skips them); this guard only blocks *new* assignments.
+    """
     profile = _canonical_assignee(profile)
+    if profile and profile in retired_assignees():
+        raise ValueError(
+            f"cannot assign {task_id}: profile {profile!r} is retired "
+            f"(kanban.retired_assignees). Reassign to a live profile."
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -4539,6 +4562,40 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         (task_id,),
     ).fetchall()
     return [(r["id"], r["result"]) for r in rows]
+
+
+def retired_assignees(kanban_cfg: Optional[dict] = None) -> frozenset[str]:
+    """Return the normalized set of retired assignees from config.
+
+    Reads ``kanban.retired_assignees`` (a list of profile names). Retired
+    assignees are *never* spawned by the dispatcher, even when their
+    profile directory exists on disk — retirement is a dispatch-level
+    block, not a filesystem state. Historical tasks may keep a retired
+    assignee (they remain visible and queryable); only new spawns and new
+    explicit assignments are blocked.
+
+    An empty set means "no retirement" — the historical default, so an
+    install without the key behaves exactly as before. The key is
+    documented in ``config_defaults.py``; an unrecognized key would be a
+    silent no-op, which is why the helper returns a set that is empty by
+    default and why callers never guess at unknown keys.
+
+    ``kanban_cfg`` may be passed in (tests) to avoid a config reload.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = load_config().get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+    raw = (kanban_cfg or {}).get("retired_assignees") or []
+    if isinstance(raw, str):
+        # Tolerate a single bare name; normalize like a one-item list.
+        raw = [raw]
+    return frozenset(
+        str(name).strip() for name in raw if str(name).strip()
+    )
 
 
 _PLUGIN_COMPAT_LAZY = {
