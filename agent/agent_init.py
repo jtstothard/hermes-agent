@@ -877,6 +877,12 @@ def init_agent(
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
+    agent._grace_turn_used = False
+    # Post-budget terminal grace (kanban workers): True while the single
+    # terminal-only grace turn is executing; _kanban_terminal_emitted is
+    # set when kanban_complete / kanban_block actually ran in that turn.
+    agent._in_grace_turn = False
+    agent._kanban_terminal_emitted = False
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the

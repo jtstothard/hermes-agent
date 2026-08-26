@@ -1399,7 +1399,51 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    # ── Post-budget terminal grace (kanban workers only) ──────────────
+    # The work budget is spent but a kanban worker still needs ONE
+    # chance to emit a terminal tool (kanban_complete / kanban_block).
+    # Without this, a worker that finishes its work on the final
+    # in-budget turn is forced into a toolless summary call and the
+    # dispatcher records timed_out + retries (the "terminator race").
+    #
+    # Conditions (all must hold):
+    #   * HERMES_KANBAN_TASK is set (board worker session)
+    #   * no interrupt/cancellation pending
+    #   * the run is not already terminal (kanban_complete/block
+    #     already emitted this session)
+    #   * the budget is exhausted — keyed on api_call_count >=
+    #     max_iterations (the same signal the loop's while condition
+    #     uses; iteration_budget.remaining is a separate 30-unit budget
+    #     that --max-turns does not shrink).
+    def _grace_eligible() -> bool:
+        """True when this kanban worker is entitled to the one grace turn."""
+        return bool(
+            os.environ.get("HERMES_KANBAN_TASK")
+            and api_call_count >= agent.max_iterations
+            and not getattr(agent, "_grace_turn_used", False)
+            and not agent._interrupt_requested
+            and not getattr(agent, "_kanban_terminal_emitted", False)
+        )
+
+    if _grace_eligible() and not agent._budget_grace_call:
+        agent._budget_grace_call = True
+        agent._in_grace_turn = True
+
+    def _loop_should_continue() -> bool:
+        """Loop-entry predicate: normal budget remaining, or one grace turn."""
+        if agent._budget_grace_call:
+            return True
+        if _grace_eligible():
+            # Budget exhausted — grant exactly one grace turn.
+            agent._budget_grace_call = True
+            agent._in_grace_turn = True
+            return True
+        return (
+            api_call_count < agent.max_iterations
+            and agent.iteration_budget.remaining > 0
+        )
+
+    while _loop_should_continue():
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1430,6 +1474,7 @@ def run_conversation(
         # this iteration regardless of outcome.
         if agent._budget_grace_call:
             agent._budget_grace_call = False
+            agent._grace_turn_used = True
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
@@ -1463,6 +1508,57 @@ def run_conversation(
                 agent.step_callback(api_call_count, prev_tools)
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
+
+        # ── Grace-turn tool restriction ───────────────────────────────
+        # During the terminal-only grace turn, expose ONLY the terminal
+        # kanban tools to the model.  This is enforced technically: both
+        # agent.tools (the request schemas) and agent.valid_tool_names (the
+        # executor's enabled_tools allowlist) are swapped to the terminal
+        # set, so any general work tool the model attempts is refused by
+        # the executor itself, not merely discouraged by a nudge.
+        _grace_prev_tools = None
+        _grace_prev_valid = None
+        if getattr(agent, "_in_grace_turn", False):
+            from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS
+
+            _grace_prev_tools = agent.tools
+            _grace_prev_valid = agent.valid_tool_names
+            agent.tools = [
+                t for t in (agent.tools or [])
+                if (t.get("function") or {}).get("name") in _TERMINAL_KANBAN_TOOLS
+            ]
+            agent.valid_tool_names = set(_TERMINAL_KANBAN_TOOLS)
+            # The terminal tools must actually be present in the registry;
+            # if the worker profile lacks them (misconfiguration), do not
+            # silently grant a broken grace turn — fall through to the
+            # existing timeout path by clearing the grace flag.
+            if not agent.tools:
+                agent.tools = _grace_prev_tools
+                agent.valid_tool_names = _grace_prev_valid
+                _grace_prev_tools = None
+                _grace_prev_valid = None
+                agent._budget_grace_call = False
+                agent._in_grace_turn = False
+                logger.warning(
+                    "grace turn aborted: no terminal kanban tools available "
+                    "task=%s",
+                    os.environ.get("HERMES_KANBAN_TASK", ""),
+                )
+            else:
+                # Inject the terminal-only instruction so the model knows
+                # why only two tools are available and what the consequence
+                # of not terminating is.
+                from agent.kanban_stop import build_kanban_grace_nudge
+
+                try:
+                    messages.append({
+                        "role": "user",
+                        "content": build_kanban_grace_nudge(),
+                        "_kanban_grace_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                except Exception:
+                    logger.debug("grace nudge injection failed", exc_info=True)
 
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
@@ -6310,6 +6406,52 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # ── Grace-turn terminal detection ──────────────────────
+                # After tool execution in the grace turn: if a terminal
+                # kanban tool (kanban_complete / kanban_block) ran, the run
+                # is already closed in the DB via the tool's CAS-safe path.
+                # Record that and restore the full tool registry so the
+                # loop's normal finalization (text_response) completes
+                # cleanly.
+                if getattr(agent, "_in_grace_turn", False):
+                    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS
+
+                    _ran_terminal = {
+                        tc.function.name for tc in assistant_message.tool_calls
+                    } & _TERMINAL_KANBAN_TOOLS
+                    if _ran_terminal:
+                        agent._kanban_terminal_emitted = True
+                        logger.info(
+                            "grace turn emitted terminal tool(s): %s task=%s",
+                            sorted(_ran_terminal),
+                            os.environ.get("HERMES_KANBAN_TASK", ""),
+                        )
+                    # Restore the full registry regardless of which tool
+                    # ran (terminal or refused general tool).  The grace
+                    # flag is already consumed, so the loop exits after
+                    # this iteration no matter what.
+                    if _grace_prev_tools is not None:
+                        agent.tools = _grace_prev_tools
+                        agent.valid_tool_names = _grace_prev_valid
+                        _grace_prev_tools = None
+                        _grace_prev_valid = None
+                    agent._in_grace_turn = False
+
+                    # If a terminal tool ran, the DB run is already closed
+                    # by the tool (CAS-safe).  Break immediately with a
+                    # synthetic successful exit — the model does not need a
+                    # follow-up "done" response, and the loop would exit
+                    # anyway (grace flag consumed).  This must land as a
+                    # text_response so the finalizer computes completed=True
+                    # and never records timed_out.
+                    if _ran_terminal:
+                        _turn_exit_reason = "text_response(kanban_terminal_grace)"
+                        final_response = (
+                            final_response
+                            or f"Grace turn completed: {sorted(_ran_terminal)}"
+                        )
+                        break
+
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
@@ -7109,52 +7251,72 @@ def run_conversation(
                 # report") and stop with finish_reason=stop — a clean exit
                 # that the dispatcher records as protocol_violation. Nudge
                 # once or twice before allowing that exit.
-                try:
-                    from agent.kanban_stop import build_kanban_stop_nudge
+                #
+                # During the terminal-only grace turn this guard is
+                # bypassed: the grace turn has no work tools, so a plain
+                # text exit is NOT a protocol violation to nudge — it is a
+                # decision not to terminate, which must fall through to the
+                # bounded timeout path (record timed_out exactly once).
+                if not getattr(agent, "_in_grace_turn", False):
+                    try:
+                        from agent.kanban_stop import build_kanban_stop_nudge
 
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
-                except Exception:
-                    logger.debug("kanban stop-loop check failed", exc_info=True)
-                    _kanban_nudge = None
+                        _kanban_nudge = build_kanban_stop_nudge(
+                            messages=messages,
+                            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                        )
+                    except Exception:
+                        logger.debug("kanban stop-loop check failed", exc_info=True)
+                        _kanban_nudge = None
 
-                if _kanban_nudge:
-                    agent._kanban_stop_nudges = (
-                        getattr(agent, "_kanban_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
-                    messages.append(final_msg)
-                    messages.append({
-                        "role": "user",
-                        "content": _kanban_nudge,
-                        "_kanban_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.info(
-                        "kanban stop-loop nudge issued (attempt %d) task=%s",
-                        agent._kanban_stop_nudges,
-                        os.environ.get("HERMES_KANBAN_TASK", ""),
-                    )
-                    agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
-                    )
-                    # Same finalizer contract as verify-on-stop: clear
-                    # final_response while continuing so a later budget
-                    # exhaustion path does not treat the narrated stop as
-                    # a completed answer.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
+                    if _kanban_nudge:
+                        agent._kanban_stop_nudges = (
+                            getattr(agent, "_kanban_stop_nudges", 0) + 1
+                        )
+                        final_msg["finish_reason"] = "kanban_terminal_required"
+                        final_msg["_kanban_stop_synthetic"] = True
+                        messages.append(final_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": _kanban_nudge,
+                            "_kanban_stop_synthetic": True,
+                        })
+                        agent._session_messages = messages
+                        logger.info(
+                            "kanban stop-loop nudge issued (attempt %d) task=%s",
+                            agent._kanban_stop_nudges,
+                            os.environ.get("HERMES_KANBAN_TASK", ""),
+                        )
+                        agent._emit_status(
+                            "⚠️ Kanban worker tried to exit without "
+                            "kanban_complete/kanban_block — nudging to finish"
+                        )
+                        # Same finalizer contract as verify-on-stop: clear
+                        # final_response while continuing so a later budget
+                        # exhaustion path does not treat the narrated stop as
+                        # a completed answer.
+                        _pending_verification_response = final_response
+                        _pending_verification_response_previewed = (
+                            agent._interim_content_was_streamed(final_response or "")
+                        )
+                        final_response = None
+                        continue
 
                 messages.append(final_msg)
                 
+                # A plain-text exit from the grace turn (no terminal tool)
+                # is NOT a successful completion: the worker chose not to
+                # terminate, so the task must fall through to the bounded
+                # timeout path.  Force budget_exhausted so the finalizer
+                # records timed_out exactly once.
+                if getattr(agent, "_in_grace_turn", False):
+                    _turn_exit_reason = "budget_exhausted"
+                    logger.info(
+                        "grace turn produced no terminal tool — falling "
+                        "through to timed_out task=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
+                    break
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")

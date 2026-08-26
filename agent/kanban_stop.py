@@ -66,6 +66,27 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def build_kanban_grace_nudge() -> str:
+    """Return the terminal-only grace-turn instruction for a kanban worker.
+
+    Injected as a synthetic user message at the start of the single
+    post-budget grace turn.  The turn exposes only ``kanban_complete`` /
+    ``kanban_block`` (enforced technically by the tool registry swap), so
+    the nudge tells the model what the allowed terminal actions are.
+    """
+    tid = (os.environ.get("HERMES_KANBAN_TASK") or "this task").strip()
+    return (
+        "[System: The work-turn budget for this Hermes kanban worker session "
+        "is exhausted. You may now ONLY finalize the Kanban task.\n\n"
+        f"Task `{tid}` is still `running`.\n\n"
+        "Call `kanban_complete(summary=..., artifacts=[...])` if the task is "
+        "complete, OR `kanban_block(reason=...)` if evidence shows it cannot "
+        "complete. No further work tools are available in this turn.\n\n"
+        "If you do not call a terminal tool now, the task will be recorded "
+        "as timed out and retried.]"
+    )
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -102,6 +123,7 @@ def build_kanban_stop_nudge(
 
 
 __all__ = [
+    "build_kanban_grace_nudge",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",

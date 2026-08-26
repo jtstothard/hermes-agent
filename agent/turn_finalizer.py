@@ -22,6 +22,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import logging
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -51,6 +52,54 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+
+def _record_kanban_budget_exhausted(
+    kanban_task: str,
+    api_call_count: int,
+    max_iterations: int,
+    logger: logging.Logger,
+) -> None:
+    """Record a terminal ``timed_out`` outcome for a kanban worker that
+    exhausted its iteration budget.
+
+    This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
+    (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
+    already closed the run this is a no-op — so it is safe to call from
+    multiple exit paths.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        _conn = _kb.connect()
+        try:
+            _kb._record_task_failure(
+                _conn,
+                kanban_task,
+                error=(
+                    f"Iteration budget exhausted "
+                    f"({api_call_count}/{max_iterations}) — "
+                    "task could not complete within the allowed "
+                    "iterations"
+                ),
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                },
+            )
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "Failed to record budget-exhausted failure for task %s",
+            kanban_task,
+            exc_info=True,
+        )
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -107,9 +156,57 @@ def finalize_turn(
         and budget_fallback_eligible
     )
 
+    # ── Post-budget terminal grace outcome ────────────────────────────
+    # If the grace turn successfully emitted a terminal kanban tool
+    # (kanban_complete / kanban_block), the run is already closed in the
+    # DB by the tool's CAS-safe path.  The worker DID terminate; the
+    # timeout bookkeeping below must be skipped entirely and the turn
+    # recorded as completed.  (Defensive: also restore the full tool
+    # registry here in case an exception path skipped the in-loop
+    # restore, so a torn grace turn can never leak a restricted registry
+    # into a later turn.)
+    _grace_terminal_ok = bool(getattr(agent, "_kanban_terminal_emitted", False))
+    if getattr(agent, "_in_grace_turn", False):
+        agent._in_grace_turn = False
+        logger.info(
+            "finalizer: cleared stale grace-turn state (torn exit path) "
+            "task=%s",
+            os.environ.get("HERMES_KANBAN_TASK", ""),
+        )
+        # Torn grace turn: restore the full tool registry if it is still
+        # restricted to the terminal set (the in-loop restore was skipped
+        # by an exception path).  Only rebuild when the registry actually
+        # looks restricted — never clobber a healthy full registry.
+        _names = {
+            (t.get("function") or {}).get("name")
+            for t in (getattr(agent, "tools", None) or [])
+        }
+        if _names and _names <= {"kanban_complete", "kanban_block"}:
+            try:
+                from model_tools import get_tool_definitions as _gt_defs
+
+                agent.tools = _gt_defs(
+                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    quiet_mode=agent.quiet_mode,
+                )
+                agent.valid_tool_names = {
+                    (t.get("function") or {}).get("name")
+                    for t in (agent.tools or [])
+                }
+            except Exception:
+                logger.debug(
+                    "finalizer: tool-registry restore failed (grace torn)",
+                    exc_info=True,
+                )
+
     iteration_limit_fallback = False
     preserved_verification_fallback = False
-    if continuation_budget_exhausted:
+    if _grace_terminal_ok:
+        # Terminal tool already closed the run.  Do not run the toolless
+        # summary, do not record timed_out.
+        _turn_exit_reason = "text_response(kanban_terminal_grace)"
+    elif continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
         # one. Preserve that exact answer instead of replacing it with another
@@ -153,42 +250,23 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+            _record_kanban_budget_exhausted(
+                _kanban_task, api_call_count, agent.max_iterations, logger,
+            )
+    elif budget_exhausted and not _grace_terminal_ok:
+        # Bounded fallback (#87096): budget was exhausted but none of the
+        # normal fallback paths were eligible (interrupted / failed /
+        # anomalous exit_reason). If running as a kanban worker we must
+        # still record a terminal outcome so the task does not remain in
+        # an ambiguous lifecycle state. The worker's run is closed via
+        # ``_record_task_failure`` (compare-and-swap receipt path) which
+        # is a no-op if another path closed it — the CAS invariant in
+        # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        if _kanban_task:
+            _record_kanban_budget_exhausted(
+                _kanban_task, api_call_count, agent.max_iterations, logger,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -198,6 +276,7 @@ def finalize_turn(
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or _grace_terminal_ok
         )
     )
 
