@@ -127,8 +127,7 @@ class GatewayKanbanWatchersMixin:
 
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``respawn_guarded`` (hard-stop only)). Sends one
+        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. When a task reaches a terminal state
         (``completed`` / ``archived``), the subscription is removed.
@@ -156,7 +155,7 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "respawn_guarded")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -482,23 +481,6 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
-                            )
-                        elif kind == "respawn_guarded":
-                            # Only notify on actionable hard-stops where
-                            # the task was demoted to sticky ``blocked``
-                            # and requires explicit unblock. Routine
-                            # cooldown / auth / recent-success guards
-                            # are silent (cursor still advances so they
-                            # don't wedge later events).
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = str(ev.payload["reason"])
-                            if reason != "dependency_wait_escalated":
-                                continue
-                            msg = (
-                                f"⏸ {board_tag}{tag}Kanban {sub['task_id']}"
-                                f" dependency wait hard-stopped"
-                                f" — explicit unblock required"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
