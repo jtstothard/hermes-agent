@@ -24,6 +24,9 @@ class _FailingAdapter:
         self.attempts += 1
         raise RuntimeError(f"simulated transport failure #{self.attempts}")
 
+    async def _send_with_retry(self, chat_id=None, content=None, metadata=None, **kwargs):
+        return await self.send(chat_id, content, metadata=metadata)
+
     async def handle_message(self, event):
         self.handled.append(event)
 
@@ -41,6 +44,9 @@ class _FailThenSucceedAdapter:
         if self.attempts <= self.fail_until_attempt:
             raise RuntimeError(f"simulated failure #{self.attempts}")
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def _send_with_retry(self, chat_id=None, content=None, metadata=None, **kwargs):
+        return await self.send(chat_id, content, metadata=metadata)
 
     async def handle_message(self, event):
         self.handled.append(event)

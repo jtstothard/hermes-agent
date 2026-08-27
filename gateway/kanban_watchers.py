@@ -527,21 +527,71 @@ class GatewayKanbanWatchersMixin:
                             # the self-post outcome, not by skipping the send.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            # Delivery ledger + retrying send: record the
+                            # obligation BEFORE sending so a gateway
+                            # crash between send success and cursor advance can
+                            # redeliver on next boot; use _send_with_retry for
+                            # transient-error retries (FloodWait honor, plain-
+                            # text fallback) instead of a single bare send.
+                            _ping_obligation_id: Optional[str] = None
+                            try:
+                                from gateway.delivery_ledger import (
+                                    compute_obligation_id,
+                                    ledger_enabled,
+                                    mark_attempting,
+                                    record_obligation,
+                                )
+                                if ledger_enabled():
+                                    _ping_session_key = (
+                                        f"agent:kanban:notifier:"
+                                        f"{platform_str}:{sub['chat_id']}:"
+                                        f"{sub.get('thread_id') or ''}"
+                                    )
+                                    _ping_obligation_id = compute_obligation_id(
+                                        _ping_session_key, sub["task_id"] + kind, msg,
+                                    )
+                                    record_obligation(
+                                        obligation_id=_ping_obligation_id,
+                                        session_key=_ping_session_key,
+                                        platform=platform_str,
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or None,
+                                        content=msg,
+                                    )
+                                    mark_attempting(_ping_obligation_id)
+                            except Exception:
+                                logger.debug(
+                                    "kanban notifier: delivery ledger record "
+                                    "failed for text ping %s", sub["task_id"],
+                                    exc_info=True,
+                                )
+                                _ping_obligation_id = None
+                            _send_res = await adapter._send_with_retry(
+                                chat_id=sub["chat_id"],
+                                content=msg,
+                                metadata=metadata,
                             )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
+                            # _send_with_retry returns SendResult; a failed
+                            # result must count as a FAILED delivery —
+                            # otherwise the cursor advances and the event is
+                            # permanently lost. Non-SendResult shapes keep the
+                            # legacy "no exception == delivered" contract.
                             if getattr(_send_res, "success", True) is False:
                                 raise RuntimeError(
-                                    "adapter send() reported failure: "
+                                    "adapter _send_with_retry() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            # Mark obligation as delivered in the ledger.
+                            if _ping_obligation_id is not None:
+                                try:
+                                    from gateway.delivery_ledger import mark_delivered
+                                    mark_delivered(_ping_obligation_id)
+                                except Exception:
+                                    logger.debug(
+                                        "kanban notifier: delivery ledger "
+                                        "mark_delivered failed for %s",
+                                        sub["task_id"], exc_info=True,
+                                    )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -572,6 +622,17 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            # Mark the ledger obligation failed
+                            # so the next boot / rewind retry can redeliver.
+                            if _ping_obligation_id is not None:
+                                try:
+                                    from gateway.delivery_ledger import mark_failed
+                                    mark_failed(
+                                        _ping_obligation_id,
+                                        str(exc)[:500],
+                                    )
+                                except Exception:
+                                    pass
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             if fails >= MAX_SEND_FAILURES:
@@ -628,6 +689,7 @@ class GatewayKanbanWatchersMixin:
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
+                        _source = None
                         if _wake_kinds:
                             _session_key = getattr(task, "session_id", None) or ""
                         if _wake_kinds and _session_key:
@@ -648,6 +710,25 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            # Propagate the subscription's
+                            # telegram_reply_to_message_id into the wake
+                            # SessionSource so the wake response anchors to the
+                            # visible DM topic lane in Telegram Web instead of
+                            # falling back to direct_messages_topic_id.
+                            _wake_meta = sub.get("delivery_metadata")
+                            _wake_reply_to = None
+                            if isinstance(_wake_meta, dict):
+                                _wake_reply_to = _wake_meta.get("telegram_reply_to_message_id")
+                            from gateway.session import SessionSource
+                            _source = SessionSource(
+                                platform=plat,
+                                chat_id=sub["chat_id"],
+                                chat_type="group",
+                                thread_id=sub.get("thread_id") or None,
+                                user_id=sub.get("user_id"),
+                                profile=sub_profile or None,
+                                message_id=str(_wake_reply_to) if _wake_reply_to else None,
+                            )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
@@ -659,6 +740,7 @@ class GatewayKanbanWatchersMixin:
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    source=_source,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -739,6 +821,15 @@ class GatewayKanbanWatchersMixin:
                                             _delivery_meta.get("chat_type") or ""
                                         ).strip()
                                 _chat_type = _chat_type or "group"
+                                # Propagate the subscription's
+                                # telegram_reply_to_message_id into the wake
+                                # SessionSource so the wake response anchors to the
+                                # visible DM topic lane in Telegram Web instead of
+                                # falling back to direct_messages_topic_id.
+                                _wake_meta = sub.get("delivery_metadata")
+                                _wake_reply_to = None
+                                if isinstance(_wake_meta, dict):
+                                    _wake_reply_to = _wake_meta.get("telegram_reply_to_message_id")
                                 _source = SessionSource(
                                     platform=plat,
                                     chat_id=sub["chat_id"],
@@ -746,6 +837,7 @@ class GatewayKanbanWatchersMixin:
                                     thread_id=sub.get("thread_id") or None,
                                     user_id=sub.get("user_id"),
                                     profile=sub_profile or None,
+                                    message_id=str(_wake_reply_to) if _wake_reply_to else None,
                                 )
                                 # deliver_wake preserves the synthetic
                                 # MessageEvent/handle_message path for
