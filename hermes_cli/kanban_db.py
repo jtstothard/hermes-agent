@@ -6168,6 +6168,7 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
+    _needs_home: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
@@ -6238,6 +6239,15 @@ def decompose_triage_task(
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
+            # Track children that need home-fallback subscription.
+            # The actual subscription is created AFTER recompute_ready()
+            # so the cursor captures all events (created, linked, promoted).
+            _n = conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+                (new_id,),
+            ).fetchone()[0]
+            if _n == 0:
+                _needs_home.append(new_id)
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
@@ -6307,6 +6317,55 @@ def decompose_triage_task(
     # for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
+
+    # Home-channel fallback: subscribe children that inherited zero
+    # subscriptions.  Runs AFTER recompute_ready() so the cursor snaps
+    # to the final high-water (all created/linked/promoted events).
+    if _needs_home:
+        try:
+            from hermes_cli.config import cfg_get, load_config as _lc
+            from hermes_cli.profiles import get_active_profile_name as _gap
+
+            _cfg = _lc()
+            if cfg_get(_cfg, "kanban", "auto_subscribe_on_create", default=True):
+                _notifier = (
+                    os.environ.get("HERMES_PROFILE") or _gap() or "default"
+                )
+                _now = int(time.time())
+                for _home in configured_home_channels():
+                    _platform = _home["platform"]
+                    _chat_id = _home["chat_id"]
+                    _thread_id = _home.get("thread_id") or ""
+                    for _child_id in _needs_home:
+                        # Inlined INSERT to avoid nested write_txn —
+                        # add_notify_sub wraps in write_txn.
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO kanban_notify_subs
+                                (task_id, platform, chat_id, chat_type,
+                                 thread_id, user_id, notifier_profile,
+                                 delivery_metadata, created_at,
+                                 last_event_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                COALESCE((SELECT MAX(id) FROM task_events
+                                          WHERE task_id = ?), 0))
+                            """,
+                            (
+                                _child_id,
+                                _platform,
+                                _chat_id,
+                                _home_chat_type(_platform),
+                                _thread_id,
+                                None,
+                                _notifier,
+                                None,
+                                _now,
+                                _child_id,
+                            ),
+                        )
+        except Exception:
+            pass
+
     return child_ids
 
 
