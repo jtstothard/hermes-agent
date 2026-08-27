@@ -574,31 +574,34 @@ class GatewayKanbanWatchersMixin:
                         except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
-                            )
                             if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
+                                logger.error(
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(attempt %d/%d, subscription retained): %s",
                                     sub["task_id"], platform_str, fails,
+                                    MAX_SEND_FAILURES, exc,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
                             else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
+                                logger.warning(
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(attempt %d/%d): %s",
+                                    sub["task_id"], platform_str, fails,
+                                    MAX_SEND_FAILURES, exc,
                                 )
+                            # Always rewind on failure so the next tick can
+                            # retry.  The subscription is NEVER deleted on
+                            # transport failure — delivery failure may delay
+                            # but must never remove future notification
+                            # coverage.
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
                             # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
+                            # a later tick can retry.
                             break
                     else:
                         # All text pings delivered (or intentionally skipped
