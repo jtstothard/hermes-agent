@@ -8156,6 +8156,48 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
+    # --- STOPGAP (2026-08-27): dependency-wait loop guard ------------------
+    # A dependency block routes to ``todo``; recompute_ready re-promotes it
+    # whenever linked parents are done — even when the parent's verdict is
+    # NO-GO. That re-promotion emits a ``promoted`` event, so we must NOT
+    # treat ``promoted``/generic ``status`` as genuine progress (the loop
+    # itself emits them). Recurrence is derived from ``dependency_wait``
+    # EVENTS since the last explicit reset (``unblocked``/``reclaimed``) —
+    # block_task's dependency branch does NOT increment block_recurrences
+    # (verified kanban_db.py:5699-5738). Only an explicit operator action
+    # resets the window. Removed when upstream #77280/#61366 lands.
+    if True:
+        last_reset = conn.execute(
+            "SELECT MAX(id) AS max_id FROM task_events "
+            "WHERE task_id = ? AND kind IN ('unblocked', 'reclaimed')",
+            (task_id,),
+        ).fetchone()
+        reset_after = int(last_reset["max_id"]) if last_reset and last_reset["max_id"] else 0
+        dep_wait_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_events "
+            "WHERE task_id = ? AND kind = 'dependency_wait' AND id > ?",
+            (task_id, reset_after),
+        ).fetchone()["c"]
+        latest_dep_wait = conn.execute(
+            "SELECT id, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'dependency_wait' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest_dep_wait is not None:
+            dep_wait_id = int(latest_dep_wait["id"])
+            dep_wait_at = int(latest_dep_wait["created_at"] or 0)
+            if dep_wait_count >= BLOCK_RECURRENCE_LIMIT:
+                # Hard-stop: N same dependency-waits since last explicit
+                # reset. The dispatcher demotes the task to sticky
+                # ``blocked`` (see _dispatch_once_locked); an operator
+                # releases via ``hermes kanban unblock <id>`` (works on
+                # ``blocked``, emits ``unblocked`` which resets the window).
+                return "dependency_wait_escalated"
+            dep_cooldown = 300  # 5 min stopgap cooldown
+            if dep_cooldown > 0 and (now - dep_wait_at) < dep_cooldown:
+                return "dependency_wait_cooldown"
+
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
@@ -8667,6 +8709,31 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                    # --- STOPGAP (2026-08-27): hard-stop demote ----------
+                    # On dependency-wait escalation, demote the task to
+                    # sticky ``blocked`` so it stops consuming dispatcher
+                    # ticks AND gains a valid release path: an operator
+                    # runs ``hermes kanban unblock <id>`` (works only on
+                    # ``blocked``; emits ``unblocked`` which resets the
+                    # recurrence window). Leaving it in ``ready`` would be
+                    # a dead-end — unblock/reclaim/promote all refuse
+                    # ``ready`` (proven by disposable test 2026-08-27).
+                    # Removed when upstream #77280/#61366 lands.
+                    if guard_reason == "dependency_wait_escalated":
+                        demoted = conn.execute(
+                            "UPDATE tasks SET status = 'blocked', "
+                            "claim_lock = NULL, claim_expires = NULL, "
+                            "worker_pid = NULL "
+                            "WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        if demoted.rowcount == 1:
+                            _append_event(
+                                conn, row["id"], "blocked",
+                                {"reason": "dependency_wait_escalated",
+                                 "kind": "dependency",
+                                 "stopgap": True},
+                            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
