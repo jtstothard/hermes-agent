@@ -235,3 +235,51 @@ class TestCustomResponsesEffortVocabulary:
             },
         )
         assert (effort, enabled) == ("xhigh", True)
+
+
+class TestCustomAttributionTags:
+    """Shared-ai-proxy requests get additive attribution tags; local don't."""
+
+    def test_proxy_base_url_injects_tags(self, custom_profile, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config=None,
+            model="infra-debug",
+            base_url="http://192.168.10.252:8318/v1",
+            session_id="sess-xyz",
+        )
+        assert tl == {}
+        tags = eb.get("tags")
+        assert tags is not None
+        assert any(t.startswith("profile=") for t in tags)
+        assert "session=sess-xyz" in tags
+        assert "task=t_abc123" in tags
+
+    def test_local_base_url_not_tagged(self, custom_profile):
+        eb, _ = custom_profile.build_api_kwargs_extras(
+            reasoning_config=None,
+            model="qwen3",
+            base_url="http://192.168.10.251/qwen/v1",
+            session_id="sess-xyz",
+        )
+        assert "tags" not in eb
+
+    def test_no_base_url_not_tagged(self, custom_profile):
+        eb, _ = custom_profile.build_api_kwargs_extras(
+            reasoning_config=None, model="x"
+        )
+        assert "tags" not in eb
+
+    def test_tags_compose_with_reasoning(self, custom_profile, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="glm-5.2",
+            base_url="http://192.168.10.252:8318/v1",
+            session_id="s",
+        )
+        assert tl == {"reasoning_effort": "none"}
+        # think=False is now gated on Ollama-looking endpoints upstream (strict
+        # hosts 422 on it); the shared proxy is not one, so it must NOT appear.
+        assert "think" not in eb
+        assert "tags" in eb

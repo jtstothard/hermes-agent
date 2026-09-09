@@ -1,6 +1,10 @@
 """Custom / Ollama (local) provider profile: any endpoint registered as
 provider="custom" (Ollama, vLLM, llama.cpp, GLM-5.2 on ARK, …)."""
 
+from __future__ import annotations
+
+import logging
+import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +29,35 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
     return bool(host) and (host == "ollama.com" or host.endswith(".ollama.com") or "ollama" in host.split("."))
+
+logger = logging.getLogger(__name__)
+
+# Shared-ai-proxy host: requests routed through this endpoint get durable
+# profile/session/task attribution tags. Local custom endpoints (Ollama,
+# vLLM, llama.cpp, GLM/ARK) are deliberately NOT tagged — the tags are only
+# meaningful to the shared proxy's LiteLLM request_tags/metadata jsonb.
+_SHARED_PROXY_HOST = "192.168.10.252"
+
+
+def _attribution_tags(*, session_id: str | None = None) -> list[str]:
+    """Build low-risk attribution tags for shared-ai-proxy requests.
+
+    Additive-only: never raises, never blocks the request. High-cardinality
+    session/task ids go into the tags list (LiteLLM persists them to
+    request_tags/metadata jsonb) — they are NOT written to 'user' or
+    model_group, so routing/selection is untouched.
+    """
+    tags: list[str] = []
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        tags.append(f"profile={get_active_profile_name() or 'default'}")
+    except Exception:
+        logger.debug("attribution: profile tag unavailable", exc_info=True)
+    tags.append(f"session={session_id or 'none'}")
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    if task_id:
+        tags.append(f"task={task_id}")
+    return tags
 
 
 class CustomProfile(ProviderProfile):
@@ -58,6 +91,24 @@ class CustomProfile(ProviderProfile):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
+
+        # Attribution tags for shared-ai-proxy-routed requests only. Gated on
+        # the resolved base_url host so local custom endpoints stay untagged
+        # and routing/selection is never altered.
+        try:
+            _base = (ctx.get("base_url") or "").strip().lower()
+            if _base and _SHARED_PROXY_HOST in _base:
+                _tags = _attribution_tags(session_id=ctx.get("session_id"))
+                if _tags:
+                    existing = extra_body.get("tags")
+                    if isinstance(existing, list):
+                        extra_body["tags"] = existing + _tags
+                    else:
+                        extra_body["tags"] = _tags
+        except Exception:
+            logger.debug("attribution: tag injection skipped", exc_info=True)
+
+        # Ollama context window
         if ollama_num_ctx:
             extra_body["options"] = {"num_ctx": ollama_num_ctx}
         # disabled -> top-level reasoning_effort="none" (Ollama's /v1 ignores
