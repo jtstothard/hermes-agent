@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
@@ -331,6 +332,26 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _has_origin_session_context() -> bool:
+    """True when a home-eligible delivery channel exists for this create.
+
+    Mirrors tools/kanban_tools._maybe_auto_subscribe: gateway sessions set
+    platform+chat_id and TUI/desktop sessions set HERMES_SESSION_KEY. In
+    those cases the origin path owns the subscription; in a pure CLI/cron
+    process neither is present so the home fallback applies.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if platform and chat_id:
+            return True
+        key = get_session_env("HERMES_SESSION_KEY", "") or os.environ.get("HERMES_SESSION_KEY", "")
+        return bool(key)
+    except Exception:
+        return False
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -377,6 +398,27 @@ def _cmd_create(args: argparse.Namespace) -> int:
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
+        # Auto-subscribe fallback for unattached creates. The CLI has no
+        # origin session channel of its own (cron, bell scripts, human
+        # terminals), so a task finished by a dispatcher would otherwise
+        # produce a terminal event nobody is subscribed to. Any session
+        # context is left alone: the gateway /kanban handler and TUI poller
+        # register their OWN origin subscription, and adding home rows on
+        # top of those would double-notify when the origin IS a home
+        # channel. Best-effort + idempotent (INSERT OR IGNORE); a broken
+        # home config never fails the create.
+        try:
+            if not _has_origin_session_context():
+                kb.subscribe_task_to_configured_homes(conn, task_id)
+        except Exception as _autosub_exc:
+            # A broken home config must not fail the create, and must not
+            # corrupt --json stdout — log it instead of printing to stderr
+            # (run_slash merges stderr and the gateway comma-joins output).
+            logging.getLogger(__name__).warning(
+                "kanban: home auto-subscribe skipped for %s: %s",
+                task_id,
+                _autosub_exc,
+            )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))

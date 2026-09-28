@@ -1148,7 +1148,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     try:
         target = _resolve_notify_target()
         if target is None:
-            return False  # CLI / cron / test — no persistent channel
+            # Unattached origin (CLI / cron / background agent /
+            # dispatcher-spawned worker): no persistent channel of its
+            # own, so fall back to the user's CONFIGURED HOME CHANNELS.
+            # Without this, orchestration tasks created outside a chat
+            # produced terminal events nobody was subscribed to (the
+            # 61-task / 0-subscription board root cause). Idempotent and
+            # best-effort; never fails the create.
+            return _subscribe_task_to_configured_homes(conn, task_id)
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.
@@ -1163,6 +1170,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, target["platform"] if target else "", bool(target and target["chat_id"]))
         return False
+
+
+def _subscribe_task_to_configured_homes(conn: Any, task_id: str) -> bool:
+    """Delegate to the shared kanban_db helper (idempotent, best-effort).
+
+    Kept as a thin tool-local wrapper so the tool surface has a single
+    integration seam (tests patch this to prove home-fallback failures never
+    fail kanban_create). Shares ONE implementation with the dashboard and CLI
+    create paths via ``hermes_cli.kanban_db.subscribe_task_to_configured_homes``.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    return _kb.subscribe_task_to_configured_homes(conn, task_id)
 
 
 @_kanban_handler("kanban_unblock")
