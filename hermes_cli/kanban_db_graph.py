@@ -1,6 +1,7 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from typing import Any, Optional
@@ -163,6 +164,61 @@ def decompose_triage_task(
     # children in ``todo`` for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
+
+    # Home-channel fallback (#91663, d8a6557a4c adaptation): children that
+    # inherited ZERO subscriptions get subscribed to every configured home
+    # channel. Runs AFTER recompute_ready() so the cursor snaps to the final
+    # high-water (all created/linked/promoted events) — the same deferred-
+    # subscription pattern kanban_db.create_task uses. Best-effort and
+    # never raising: a broken home config must not fail a fan-out that has
+    # already been durably persisted.
+    from hermes_cli.kanban_db import configured_home_channels, _home_chat_type
+    needs_home: list[str] = []
+    for cid in child_ids:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (cid,),
+        ).fetchone()[0]
+        if n == 0:
+            needs_home.append(cid)
+    if needs_home:
+        try:
+            from hermes_cli.config import cfg_get, load_config as _lc
+            from hermes_cli.profiles import get_active_profile_name as _gap
+
+            cfg = _lc()
+            if cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+                notifier = os.environ.get("HERMES_PROFILE") or _gap() or "default"
+                for home in configured_home_channels():
+                    platform = home["platform"]
+                    for cid in needs_home:
+                        # Inlined INSERT to avoid nested write_txn —
+                        # add_notify_sub wraps in write_txn.
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO kanban_notify_subs
+                                (task_id, platform, chat_id, chat_type,
+                                 thread_id, user_id, notifier_profile,
+                                 delivery_metadata, created_at,
+                                 last_event_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                COALESCE((SELECT MAX(id) FROM task_events
+                                          WHERE task_id = ?), 0))
+                            """,
+                            (
+                                cid,
+                                platform,
+                                home["chat_id"],
+                                _home_chat_type(platform),
+                                home.get("thread_id") or "",
+                                None,
+                                notifier,
+                                None,
+                                int(time.time()),
+                                cid,
+                            ),
+                        )
+        except Exception:
+            pass
     return child_ids
 
 
