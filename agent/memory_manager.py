@@ -360,6 +360,8 @@ class MemoryManager:
         # within a bound, then report exactly what it abandoned.
         self._background_futures: Dict[Future, str] = {}
         self._shutting_down = False
+        self._shutdown_all_lock = threading.Lock()
+        self._shutdown_all_complete = False
         self._shutdown_drain_state: Dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
@@ -846,10 +848,25 @@ class MemoryManager:
         )
 
     def shutdown_all(self) -> None:
-        """Drain the background executor (bounded), then shut providers down in reverse order."""
-        self._drain_sync_executor()
-        self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
-                            providers=self._providers[::-1])
+        """Drain the background executor (bounded), then shut providers down in reverse order.
+
+        Serialized + idempotent: a concurrent or repeated caller must not invoke
+        already-partially-torn-down providers (regression gate:
+        tests/agent/test_memory_manager_shutdown.py).
+        """
+        with self._shutdown_all_lock:
+            if self._shutdown_all_complete:
+                return
+            try:
+                self._drain_sync_executor()
+                self._each_provider(
+                    "shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
+                    providers=self._providers[::-1],
+                )
+            finally:
+                # Mark complete even when one provider raises: shutdown is a
+                # best-effort terminal boundary.
+                self._shutdown_all_complete = True
 
     @property
     def shutdown_drain_state(self) -> Dict[str, Any]:
