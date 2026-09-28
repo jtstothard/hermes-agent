@@ -57,10 +57,10 @@ def diagnostic_event(ev) -> bool:
 # subscription was deleted after the first event. Same shape as the reblock-after-unblock cycle that PR
 # #22941 fixed for `blocked`. Keeping the subscription alive until the task is archived lets the cursor
 # (advanced atomically by claim_unseen_events_for_sub) handle dedup, and any retry-loop event reaches the
-# user. Per-subscription send-failure counter. Adapter.send raising means the chat is dead (deleted, bot
-# kicked, etc.) — after N consecutive send failures the sub is dropped so we don't spin against a dead chat
-# every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
-# unattended gate where a false drop means silent work pileup.
+# user. Per-subscription send-failure counter. The counter paces log escalation only: delivery
+# failure may DELAY but must NEVER remove future notification coverage, so the subscription
+# is retained past the limit and every failure rewinds the cursor for a retry next tick
+# (a genuinely dead chat retries forever instead of silently dropping coverage).
 MAX_SEND_FAILURES = 12
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
@@ -506,6 +506,10 @@ class _KanbanNotification:
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
+        # Delivery-ledger obligation recorded for the in-flight text ping, if
+        # any. delivery_failed() marks it failed so a rewind/boot retry can
+        # redeliver; a successful send clears it after mark_delivered.
+        self._pending_obligation_id: Optional[str] = None
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
@@ -528,19 +532,38 @@ class _KanbanNotification:
         self.sub_fail_counts.pop(self.sub_key, None)
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        """Bump the failure counter and ALWAYS rewind the claim so the next
+        tick retries. The subscription is NEVER deleted on transport failure —
+        delivery failure may delay but must never remove future notification
+        coverage."""
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
-        logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
         if fails >= MAX_SEND_FAILURES:
-            logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
-            await self.unsub()
-            self.clear_failures()
+            logger.error(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
+            logger.error(
+                drop_fmt + " (subscription retained)",
+                self.task_id, self.platform_str, fails,
+            )
         else:
-            await self.rewind()
+            logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
+        # Mark any pending ledger obligation failed so the next boot / rewind
+        # retry can redeliver.
+        pending = self._pending_obligation_id
+        if pending is not None:
+            try:
+                from gateway.delivery_ledger import mark_failed
+                mark_failed(pending, str(exc)[:500])
+            except Exception:
+                pass
+            self._pending_obligation_id = None
+        # Always rewind on failure so the next tick can retry. The
+        # subscription is NEVER deleted on transport failure — delivery
+        # failure may delay but must never remove future notification
+        # coverage.
+        await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
-        drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
+        drop_fmt = "kanban notifier: send failed for %s on %s after %d consecutive wake failures"
         await self.delivery_failed(fmt, (self.task_id,), drop_fmt, exc, True)
 
     # -- formatting --
@@ -618,13 +641,29 @@ class _KanbanNotification:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
         from gateway.wake import deliver_wake
         sub = self.sub
+        # Propagate the subscription's telegram_reply_to_message_id into the
+        # wake SessionSource so the wake response anchors to the visible DM
+        # topic lane in Telegram Web instead of falling back to
+        # direct_messages_topic_id.
+        _wake_meta = sub.get("delivery_metadata")
+        _wake_reply_to = None
+        if isinstance(_wake_meta, dict):
+            _wake_reply_to = _wake_meta.get("telegram_reply_to_message_id")
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
             # shared listener's /p/<profile>/ self-post would need the profile's own
             # API_SERVER_KEY, which a route-only profile legitimately does not have, and an
             # unprefixed self-post would resume the session in the DEFAULT profile's store.
             async with self._owner_scope():
+                from gateway.session import SessionSource
+                _reply_source = SessionSource(
+                    platform=self.plat, chat_id=sub["chat_id"], chat_type="group",
+                    thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"),
+                    profile=self.sub_profile or None,
+                    message_id=str(_wake_reply_to) if _wake_reply_to else None,
+                )
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
+                                   source=_reply_source,
                                    profile=self._served_wake_profile(),
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
@@ -646,6 +685,7 @@ class _KanbanNotification:
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
             profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
+            message_id=str(_wake_reply_to) if _wake_reply_to else None,
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
         from gateway.run import _async_profile_runtime_scope
@@ -669,14 +709,67 @@ class _KanbanNotification:
         _send_res = None
         async def send_ping():
             nonlocal _send_res
-            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+            # Delivery ledger + retrying send: record the obligation BEFORE
+            # sending so a gateway crash between send success and cursor
+            # advance can redeliver on next boot; ride _send_with_retry for
+            # transient-error retries (FloodWait honor, plain-text fallback)
+            # instead of a single bare send. Fail-open: a ledger problem
+            # never blocks the send.
+            obligation_id: Optional[str] = None
+            try:
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    ledger_enabled,
+                    mark_attempting,
+                    record_obligation,
+                )
+                if ledger_enabled():
+                    session_key = (
+                        f"agent:kanban:notifier:{self.platform_str}:{sub['chat_id']}:"
+                        f"{sub.get('thread_id') or ''}"
+                    )
+                    obligation_id = compute_obligation_id(
+                        session_key, sub["task_id"] + ev.kind, msg,
+                    )
+                    record_obligation(
+                        obligation_id=obligation_id,
+                        session_key=session_key,
+                        platform=self.platform_str,
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or None,
+                        content=msg,
+                    )
+                    mark_attempting(obligation_id)
+            except Exception:
+                logger.debug(
+                    "kanban notifier: delivery ledger record failed for text ping %s",
+                    self.task_id, exc_info=True,
+                )
+                obligation_id = None
+            self._pending_obligation_id = obligation_id
+            _send_res = await adapter._send_with_retry(
+                chat_id=sub["chat_id"], content=msg, metadata=metadata,
+            )
         if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
             return False
-        # SendResult(success=False) without an exception is a FAILED delivery
-        # (else the event is lost); None / non-SendResult keeps the
+        # _send_with_retry returns SendResult; success=False without an
+        # exception is a FAILED delivery (else the cursor would advance and
+        # the event be lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
-            raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+            raise RuntimeError(f"adapter _send_with_retry() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+        # Mark the obligation delivered (crash-between-send-and-advance now
+        # redelivers safely instead of silently dropping).
+        if self._pending_obligation_id is not None:
+            try:
+                from gateway.delivery_ledger import mark_delivered
+                mark_delivered(self._pending_obligation_id)
+            except Exception:
+                logger.debug(
+                    "kanban notifier: delivery ledger mark_delivered failed for %s",
+                    self.task_id, exc_info=True,
+                )
+            self._pending_obligation_id = None
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
@@ -726,7 +819,7 @@ class _KanbanNotification:
             except Exception as exc:
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
-                    "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,
+                    "kanban notifier: send failed for %s on %s after %d consecutive send failures", exc, False,
                 )
                 return False
         return True
