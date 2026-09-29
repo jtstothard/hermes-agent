@@ -353,8 +353,10 @@ class TestAttributionTagConstruction:
     ):
         """A→B→A multiplex proof: per-turn HERMES_HOME overrides bind the tag
         source. Jarvis-bound traffic emits exactly profile=jarvis, engineer
-        traffic exactly profile=engineer, and after release the launch pin
-        applies again. The launch pin must NOT re-label a bound turn.
+        traffic exactly profile=engineer, a second Jarvis-bound turn emits the
+        identical complete ordered list again (the binding truly returns to A
+        — three distinct states would prove nothing), and after release the
+        launch pin applies again. The launch pin must NOT re-label a bound turn.
 
         The fake profiles live under ``<HERMES_HOME>/profiles`` — the root
         ``get_active_profile_name`` reads (see ``fake_profiles_root``) — while
@@ -378,7 +380,9 @@ class TestAttributionTagConstruction:
         engineer.mkdir()
         assert tags_under(jarvis) == ["profile=jarvis", "session=sess-xyz"]
         assert tags_under(engineer) == ["profile=engineer", "session=sess-xyz"]
-        # Released (override fully unbound, A again): the launcher pin is honored.
+        # Second A: an identical Jarvis-bound turn emits the identical list.
+        assert tags_under(jarvis) == ["profile=jarvis", "session=sess-xyz"]
+        # Released (override fully unbound): the launcher pin is honored.
         assert get_hermes_home_override() is None
         assert tags_under(None) == ["profile=launch-host", "session=sess-xyz"]
         assert get_hermes_home_override() is None
