@@ -14,9 +14,19 @@ These tests pin the wire-shape contract:
                           including ``max``/``xhigh``
     - enabled + no effort → nothing emitted (endpoint's server default applies)
     - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+
+The attribution tests pin the shared-ai-proxy request-tag contract:
+    - gate            → parsed canonical hostname equality only (deceptive
+                        URLs that merely CONTAIN the proxy IP never tag)
+    - tags            → exactly profile=<runtime-owner profile>,
+                        session=<id> when a session exists, task=<id> only
+                        for an OWNED kanban task — complete ordered list,
+                        no sentinels, no extras
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -237,49 +247,181 @@ class TestCustomResponsesEffortVocabulary:
         assert (effort, enabled) == ("xhigh", True)
 
 
-class TestCustomAttributionTags:
-    """Shared-ai-proxy requests get additive attribution tags; local don't."""
+@pytest.fixture(autouse=True)
+def _clean_identity_env(monkeypatch):
+    """No launch pins or worker lineage in the parent shell: each test sets
+    exactly the identity inputs it is proving."""
+    for var in ("HERMES_PROFILE", "HERMES_PROFILE_NAME", "HERMES_KANBAN_TASK",
+                "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(var, raising=False)
 
-    def test_proxy_base_url_injects_tags(self, custom_profile, monkeypatch):
+
+@pytest.fixture
+def fake_profiles_root(tmp_path, monkeypatch):
+    """Profiles under the env-derived default home so ``get_active_profile_name`` —
+    whose profiles root is anchored to that home, NOT to the context-local override —
+    can name a profile bound via ``set_hermes_home_override``. Points ``HERMES_HOME``
+    at a dedicated fake root (not a profile dir of the sandbox test home), so the
+    canonicalization ``<root>/profiles/<name>`` is stable; monkeypatch restores env
+    and ``get_default_hermes_root``'s env-keyed memo is reset below."""
+    root = tmp_path / "hermes-root"
+    (root / "profiles").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_constants import _default_hermes_root_memo
+    monkeypatch.setattr("hermes_constants._default_hermes_root_memo", None)
+    return root
+
+
+def _extras_for(custom_profile, **overrides):
+    """Call ``build_api_kwargs_extras`` against the shared proxy with the
+    common shape; keyword *overrides* replace the defaults."""
+    kwargs = dict(reasoning_config=None, model="infra-debug",
+                  base_url="http://192.168.10.252:8318/v1", session_id="sess-xyz")
+    kwargs.update(overrides)
+    return custom_profile.build_api_kwargs_extras(**kwargs)
+
+
+class TestSharedProxyGate:
+    """The gate is the base_url's parsed canonical HOSTNAME, exactly.
+
+    Substring matching admits deceptive URLs (host-suffix, path, userinfo
+    tricks and neighboring IPs); the contract is: tag the proxy host, never
+    anything that merely contains its string.
+    """
+
+    @pytest.mark.parametrize(
+        ("base_url", "tagged"),
+        [
+            # The proxy itself, in the shapes production sends it.
+            ("http://192.168.10.252:8318/v1", True),
+            ("http://192.168.10.252/v1", True),          # default port
+            ("192.168.10.252", True),                    # bare host (utils parse tolerance)
+            ("HTTP://192.168.10.252:8318/V1", True),     # case canonicalization
+            # Deceptive: host SUFFIX containing the proxy IP.
+            ("http://192.168.10.252.evil.example/v1", False),
+            # Deceptive: proxy IP in the PATH, not the host.
+            ("http://evil.example/192.168.10.252/v1", False),
+            # Deceptive: proxy IP as userinfo; real host is evil.example.
+            ("http://192.168.10.252@evil.example/v1", False),
+            # Deceptive: userinfo+host double-@ trick.
+            ("http://192.168.10.252:8318@evil.example/v1", False),
+            # Neighboring IP on the same /24.
+            ("http://192.168.10.251:8318/v1", False),
+            ("http://10.0.0.252:8318/v1", False),
+            # Lookalike host with dashes instead of dots.
+            ("http://192-168-10-252.example/v1", False),
+            # No URL at all.
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_gate_tags_proxy_host_only(self, custom_profile, monkeypatch, base_url, tagged):
+        """Tagged rows emit exactly the default-profile tag list; every
+        non-proxy row (deceptive or not) emits NO ``tags`` key at all.
+
+        The profile pin makes the expected list independent of the sandbox
+        ``HERMES_HOME`` the test session runs under."""
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        eb, tl = _extras_for(custom_profile, base_url=base_url)
+        if tagged:
+            assert eb == {"tags": ["profile=default", "session=sess-xyz"]}
+        else:
+            assert eb == {}
+        assert tl == {}  # the gate never touches top-level kwargs
+
+
+class TestAttributionTagConstruction:
+    """Exact, ordered, ownership-aware tag construction."""
+
+    def test_full_tag_list_exact_order(self, custom_profile, fake_profiles_root, monkeypatch):
+        """Owning dispatcher worker: complete ordered list, nothing else."""
+        monkeypatch.setenv("HERMES_PROFILE", "custom")
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
-        eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config=None,
-            model="infra-debug",
-            base_url="http://192.168.10.252:8318/v1",
-            session_id="sess-xyz",
-        )
+        eb, tl = _extras_for(custom_profile)
+        assert eb == {"tags": ["profile=custom", "session=sess-xyz", "task=t_abc123"]}
         assert tl == {}
-        tags = eb.get("tags")
-        assert tags is not None
-        assert any(t.startswith("profile=") for t in tags)
-        assert "session=sess-xyz" in tags
-        assert "task=t_abc123" in tags
 
-    def test_local_base_url_not_tagged(self, custom_profile):
-        eb, _ = custom_profile.build_api_kwargs_extras(
-            reasoning_config=None,
-            model="qwen3",
-            base_url="http://192.168.10.251/qwen/v1",
-            session_id="sess-xyz",
-        )
-        assert "tags" not in eb
+    def test_profile_from_launch_pin_when_no_override(self, custom_profile, fake_profiles_root, monkeypatch):
+        """Without a bound override the launcher pin (HERMES_PROFILE) is the
+        runtime identity — the dispatcher pins it on its workers."""
+        monkeypatch.setenv("HERMES_PROFILE", "dispatch-worker")
+        eb, _ = _extras_for(custom_profile)
+        assert eb == {"tags": ["profile=dispatch-worker", "session=sess-xyz"]}
 
-    def test_no_base_url_not_tagged(self, custom_profile):
-        eb, _ = custom_profile.build_api_kwargs_extras(
-            reasoning_config=None, model="x"
-        )
-        assert "tags" not in eb
+    def test_multiplexed_profile_scoping_emits_bound_profile(
+        self, custom_profile, fake_profiles_root, monkeypatch
+    ):
+        """A→B→A multiplex proof: per-turn HERMES_HOME overrides bind the tag
+        source. Jarvis-bound traffic emits exactly profile=jarvis, engineer
+        traffic exactly profile=engineer, and after release the launch pin
+        applies again. The launch pin must NOT re-label a bound turn.
 
-    def test_tags_compose_with_reasoning(self, custom_profile, monkeypatch):
-        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
-        eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": False},
-            model="glm-5.2",
-            base_url="http://192.168.10.252:8318/v1",
-            session_id="s",
+        The fake profiles live under ``<HERMES_HOME>/profiles`` — the root
+        ``get_active_profile_name`` reads (see ``fake_profiles_root``) — while
+        the *binding* is the context-local override, exactly how multiplex
+        binds a turn in production."""
+        from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
+
+        monkeypatch.setenv("HERMES_PROFILE", "launch-host")
+
+        def tags_under(profile_home):
+            token = set_hermes_home_override(profile_home)
+            try:
+                eb, _ = _extras_for(custom_profile)
+                return eb["tags"]
+            finally:
+                reset_hermes_home_override(token)
+
+        jarvis = fake_profiles_root / "profiles" / "jarvis"
+        engineer = fake_profiles_root / "profiles" / "engineer"
+        jarvis.mkdir()
+        engineer.mkdir()
+        assert tags_under(jarvis) == ["profile=jarvis", "session=sess-xyz"]
+        assert tags_under(engineer) == ["profile=engineer", "session=sess-xyz"]
+        # Released (override fully unbound, A again): the launcher pin is honored.
+        assert get_hermes_home_override() is None
+        assert tags_under(None) == ["profile=launch-host", "session=sess-xyz"]
+        assert get_hermes_home_override() is None
+
+    @pytest.mark.parametrize("non_owner", ["non_dispatcher_owned_context", "delegated_child"])
+    def test_inherited_task_env_without_ownership_not_tagged(
+        self, custom_profile, fake_profiles_root, monkeypatch, non_owner
+    ):
+        """Inherited worker env does not confer ownership: cron executions and
+        delegate children run with HERMES_KANBAN_TASK in os.environ but own no
+        card — no task tag. The env var itself is never mutated."""
+        import os
+
+        from agent import delegation_context
+
+        monkeypatch.setenv("HERMES_PROFILE", "custom")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned_by_dispatcher")
+        if non_owner == "non_dispatcher_owned_context":
+            ctx = delegation_context.non_dispatcher_owned_context()
+        else:
+            ctx = delegation_context.delegated_child_context(session_id=None)
+        with ctx:
+            eb, _ = _extras_for(custom_profile)
+            assert eb == {"tags": ["profile=custom", "session=sess-xyz"]}
+        assert os.environ["HERMES_KANBAN_TASK"] == "t_owned_by_dispatcher"
+
+    @pytest.mark.parametrize("absent_session", [None, ""])
+    def test_absent_session_omits_tag_entirely(self, custom_profile, fake_profiles_root, monkeypatch, absent_session):
+        """No session, no session tag — never a ``session=none`` sentinel."""
+        monkeypatch.setenv("HERMES_PROFILE", "custom")
+        eb, _ = _extras_for(custom_profile, session_id=absent_session)
+        assert eb == {"tags": ["profile=custom"]}
+        assert not any(t.startswith("session=") for t in eb["tags"])
+
+    def test_no_duplicate_or_extra_tags_with_reasoning(self, custom_profile, fake_profiles_root, monkeypatch):
+        """Tags compose with the reasoning wire shape and stay exactly three,
+        unique, in order."""
+        monkeypatch.setenv("HERMES_PROFILE", "custom")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dup")
+        eb, tl = _extras_for(
+            custom_profile, reasoning_config={"enabled": True, "effort": "high"}, model="glm-5.2"
         )
-        assert tl == {"reasoning_effort": "none"}
-        # think=False is now gated on Ollama-looking endpoints upstream (strict
-        # hosts 422 on it); the shared proxy is not one, so it must NOT appear.
-        assert "think" not in eb
-        assert "tags" in eb
+        tags = eb["tags"]
+        assert tags == ["profile=custom", "session=sess-xyz", "task=t_dup"]
+        assert len(tags) == len(set(tags))
+        assert tl == {"reasoning_effort": "high"}

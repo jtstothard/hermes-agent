@@ -4,14 +4,13 @@ provider="custom" (Ollama, vLLM, llama.cpp, GLM-5.2 on ARK, …)."""
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 from urllib.parse import urlparse
 
 from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
 from providers import register_provider
 from providers.base import ProviderProfile
-from utils import base_url_host_matches
+from utils import base_url_hostname, base_url_host_matches
 
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
@@ -39,22 +38,45 @@ logger = logging.getLogger(__name__)
 _SHARED_PROXY_HOST = "192.168.10.252"
 
 
+def _is_shared_proxy_base_url(base_url: Any) -> bool:
+    """True when *base_url* points at the shared proxy: the parsed canonical
+    HOSTNAME equals the proxy host exactly. Substring matching is not a host
+    check — ``http://192.168.10.252.evil.example/v1`` and
+    ``http://evil.example/192.168.10.252/v1`` contain the string but are not
+    the proxy — so the URL is parsed like every other provider host gate
+    (``utils.base_url_hostname``). Unparseable/absent hosts never match."""
+    try:
+        return base_url_hostname(str(base_url or "")) == _SHARED_PROXY_HOST
+    except Exception:
+        logger.debug("attribution: base_url host check skipped", exc_info=True)
+        return False
+
+
 def _attribution_tags(*, session_id: str | None = None) -> list[str]:
     """Build low-risk attribution tags for shared-ai-proxy requests.
 
     Additive-only: never raises, never blocks the request. High-cardinality
     session/task ids go into the tags list (LiteLLM persists them to
     request_tags/metadata jsonb) — they are NOT written to 'user' or
-    model_group, so routing/selection is untouched.
+    model_group, so routing/selection is untouched. Identity tags appear only
+    when real identity exists: an absent session emits no session tag, and the
+    task tag follows the kanban ownership contract (an inherited worker env
+    without an owned card produces no task tag).
     """
     tags: list[str] = []
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        tags.append(f"profile={get_active_profile_name() or 'default'}")
+        from hermes_cli.profiles import current_profile_name
+        tags.append(f"profile={current_profile_name(default='default') or 'default'}")
     except Exception:
         logger.debug("attribution: profile tag unavailable", exc_info=True)
-    tags.append(f"session={session_id or 'none'}")
-    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    if session_id:
+        tags.append(f"session={session_id}")
+    try:
+        from agent.delegation_context import owned_kanban_task
+        task_id = owned_kanban_task()
+    except Exception:
+        logger.debug("attribution: task tag unavailable", exc_info=True)
+        task_id = ""
     if task_id:
         tags.append(f"task={task_id}")
     return tags
@@ -93,11 +115,11 @@ class CustomProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
 
         # Attribution tags for shared-ai-proxy-routed requests only. Gated on
-        # the resolved base_url host so local custom endpoints stay untagged
+        # the base_url's parsed hostname (exact match — substring checks admit
+        # deceptive non-proxy URLs) so local custom endpoints stay untagged
         # and routing/selection is never altered.
         try:
-            _base = (ctx.get("base_url") or "").strip().lower()
-            if _base and _SHARED_PROXY_HOST in _base:
+            if _is_shared_proxy_base_url(ctx.get("base_url")):
                 _tags = _attribution_tags(session_id=ctx.get("session_id"))
                 if _tags:
                     existing = extra_body.get("tags")
